@@ -185,6 +185,10 @@ struct AddWeightedOp : public BaseAddOp
         int dtype = (flags & MIXED_TYPE) ? dst.type() : -1;
         cv::addWeighted(src[0], alpha, src[1], beta, gamma[0], dst, dtype);
     }
+    double getMaxErr(int depth)
+    {
+        return depth < CV_32F ? 1 : depth == CV_32F ? 1e-4 : 1e-12;
+    }
 };
 
 struct MulOp : public BaseElemWiseOp
@@ -2624,6 +2628,23 @@ TEST(BroadcastTo, basic) {
         broadcast(_src, shape, dst);
         fn_verify(ref, dst);
     }
+
+    {
+        std::vector<int> shape{1, 0};
+        std::vector<int> data;
+        Mat zero_src(static_cast<int>(shape.size()), shape.data(), CV_32FC1, data.data());
+
+        std::vector<int> target_shape{3, 0};
+        Mat dst;
+
+        broadcast(zero_src, target_shape, dst);
+
+        EXPECT_EQ(dst.dims, 2);
+        EXPECT_EQ(dst.size[0], 3);
+        EXPECT_EQ(dst.size[1], 0);
+        EXPECT_EQ(dst.total(), 0u);
+    }
+
 }
 
 TEST(Core_minMaxIdx, regression_9207_2)
@@ -2841,6 +2862,39 @@ TEST(Core_ConvertTo, regression_12121)
         Mat dst;
         src.convertTo(dst, CV_16U);
         EXPECT_EQ(65535, dst.at<ushort>(0, 0)) << "src=" << src.at<int>(0, 0);
+    }
+}
+
+TEST(Core_AbsDiff, regression_29639_integer_overflow)
+{
+    const struct { int a, b; } cases[] = {
+        { INT_MIN, 0       },
+        { 0,       INT_MIN },
+        { INT_MIN, INT_MAX },
+        { INT_MAX, INT_MIN },
+        { INT_MIN, -1      },
+        { INT_MAX, 0       },
+        { 7,      -5       },
+    };
+    for (const auto& c : cases)
+    {
+        cv::Mat a(3, 11, CV_32SC1, cv::Scalar(c.a));
+        cv::Mat b(3, 11, CV_32SC1, cv::Scalar(c.b));
+        cv::Mat d;
+        cv::absdiff(a, b, d);
+
+        int wraparound = (int)((unsigned)std::max(c.a, c.b) - (unsigned)std::min(c.a, c.b));
+        int64 diff = (int64)c.a - (int64)c.b;
+        int saturated = cv::saturate_cast<int>(diff < 0 ? -diff : diff);
+
+        int first = d.at<int>(0, 0);
+        int last  = d.at<int>(d.rows - 1, d.cols - 1);
+        EXPECT_TRUE(first == wraparound || first == saturated)
+            << "absdiff(" << c.a << ", " << c.b << ") first element (vector path) = "
+            << first << ", expected wraparound " << wraparound << " or saturate " << saturated;
+        EXPECT_TRUE(last == wraparound || last == saturated)
+            << "absdiff(" << c.a << ", " << c.b << ") last element (scalar remainder) = "
+            << last << ", expected wraparound " << wraparound << " or saturate " << saturated;
     }
 }
 

@@ -415,22 +415,21 @@ public:
             int w = std::min(tileSize, dst.cols - dst_x);
             int h = std::min(tileSize, dst.rows - dst_y);
 
-            int src_x1 = dst_x - dx1, src_y1 = dst_y - dy1;
-            int src_x2 = dst_x + w + dx2, src_y2 = dst_y + h + dy2;
+            Size wholeSize;
+            Point ofs;
+            src.locateROI(wholeSize, ofs);
+
+            // Parent coordinates.
+            int src_x1 = ofs.x + dst_x - dx1, src_y1 = ofs.y + dst_y - dy1;
+            int src_x2 = ofs.x + dst_x + w + dx2,
+                src_y2 = ofs.y + dst_y + h + dy2;
 
             int pad_top    = std::max(0, -src_y1);
-            int pad_bottom = std::max(0,  src_y2 - src.rows);
+            int pad_bottom = std::max(0, src_y2 - wholeSize.height);
             int pad_left   = std::max(0, -src_x1);
-            int pad_right  = std::max(0,  src_x2 - src.cols);
+            int pad_right = std::max(0, src_x2 - wholeSize.width);
 
-            int clamped_x1 = std::max(0, src_x1);
-            int clamped_y1 = std::max(0, src_y1);
-            int clamped_x2 = std::min(src.cols, src_x2);
-            int clamped_y2 = std::min(src.rows, src_y2);
-
-            Mat src_region = src(Rect(clamped_x1, clamped_y1,
-                                      clamped_x2 - clamped_x1,
-                                      clamped_y2 - clamped_y1));
+            Mat src_region = src(Rect(dst_x, dst_y, w, h)).adjustROI(dy1, dy2, dx1, dx2);
 
             Mat tile_mat;
             if (pad_top == 0 && pad_bottom == 0 && pad_left == 0 && pad_right == 0)
@@ -542,9 +541,41 @@ void FilterEngine__apply(FilterEngine& this_, const Mat& src, Mat& dst, const Si
         (size_t)src.total() >= std::max((size_t)1024 * 1024, (size_t)nthreads * 64 * 1024) &&
         this_.rowBorderType == this_.columnBorderType)
     {
-        // For in-place operations (e.g. morphologyEx MORPH_OPEN), clone src so that
-        // concurrent tiles read from an immutable snapshot rather than racing on writes.
-        Mat src_copy = (src.data == dst.data) ? src.clone() : src;
+        // Robust cloning for in-place/overlapping operations with ROI support.
+        Size resolved_wsz = wsz;
+        Point resolved_ofs = ofs;
+        if (resolved_wsz.width < 0) {
+            src.locateROI(resolved_wsz, resolved_ofs);
+        }
+
+        bool overlap = (src.data <= dst.dataend && dst.data <= src.dataend);
+        Mat src_copy;
+        if (resolved_wsz == src.size()) {
+            src_copy = overlap ? src.clone() : src;
+        } else {
+            // In case of ROI.
+            Mat parent(resolved_wsz, src.type(),
+                       (void*)(src.data - resolved_ofs.y * src.step -
+                               resolved_ofs.x * src.elemSize()),
+                       src.step);
+            if (overlap) {
+                int dx1 = this_.anchor.x, dx2 = this_.ksize.width - dx1 - 1;
+                int dy1 = this_.anchor.y, dy2 = this_.ksize.height - dy1 - 1;
+
+                int p_x1 = std::max(0, resolved_ofs.x - dx1);
+                int p_y1 = std::max(0, resolved_ofs.y - dy1);
+
+                // Clone the required region only.
+                Mat required_region = parent(Rect(resolved_ofs, src.size())).adjustROI(dy1, dy2, dx1, dx2).clone();
+
+                src_copy = required_region(Rect(resolved_ofs - Point(p_x1, p_y1), src.size()));
+            } else {
+                // Actually src_copy = src but makes sure src_copy is seen as a sub-matrix
+                // because sepFilter2D creates a submatrix on the fly without having it be
+                // an official sub-matrix (which would make locateROI fail in TiledFilterInvoker)
+                src_copy = parent(Rect(resolved_ofs, src.size()));
+            }
+        }
 
         // Heuristic: Balance L2 cache locality (128) vs parallel load balancing (64).
         int tileSize = (src.total() < (size_t)nthreads * 128 * 128 * 4) ? 64 : 128;
@@ -765,13 +796,14 @@ struct RowVec_8u32f
 
 struct SymmRowSmallVec_8u32s
 {
-    SymmRowSmallVec_8u32s() { smallValues = false; symmetryType = 0; }
+    SymmRowSmallVec_8u32s() { smallValues = false; int16Sums = false; symmetryType = 0; }
     SymmRowSmallVec_8u32s( const Mat& _kernel, int _symmetryType )
     {
         kernel = _kernel;
         symmetryType = _symmetryType;
         smallValues = true;
         int k, ksize = kernel.rows + kernel.cols - 1;
+        int absSum = 0;
         for( k = 0; k < ksize; k++ )
         {
             int v = kernel.ptr<int>()[k];
@@ -780,7 +812,9 @@ struct SymmRowSmallVec_8u32s
                 smallValues = false;
                 break;
             }
+            absSum += std::abs(v);
         }
+        int16Sums = smallValues && absSum*UCHAR_MAX <= SHRT_MAX;
     }
 
     int operator()(const uchar* src, uchar* _dst, int width, int cn) const
@@ -913,34 +947,46 @@ struct SymmRowSmallVec_8u32s
             }
             else if( _ksize == 5 )
             {
-                if( kx[0] == -2 && kx[1] == 0 && kx[2] == 1 )
+                if( int16Sums )
                 {
+                    v_int16 k0 = vx_setall_s16((short)kx[0]);
+                    v_int16 k1 = vx_setall_s16((short)kx[1]);
+                    v_int16 k2 = vx_setall_s16((short)kx[2]);
                     for( ; i <= width - VTraits<v_uint8>::vlanes(); i += VTraits<v_uint8>::vlanes(), src += VTraits<v_uint8>::vlanes() )
                     {
-                        v_uint16 x0l, x0h, x1l, x1h, x2l, x2h;
-                        v_expand(vx_load(src - 2*cn), x0l, x0h);
-                        v_expand(vx_load(src), x1l, x1h);
-                        v_expand(vx_load(src + 2*cn), x2l, x2h);
-                        x1l = v_sub_wrap(v_add_wrap(x0l, x2l), v_add_wrap(x1l, x1l));
-                        x1h = v_sub_wrap(v_add_wrap(x0h, x2h), v_add_wrap(x1h, x1h));
-                        v_store(dst + i, v_expand_low(v_reinterpret_as_s16(x1l)));
-                        v_store(dst + i + VTraits<v_int32>::vlanes(), v_expand_high(v_reinterpret_as_s16(x1l)));
-                        v_store(dst + i + 2*VTraits<v_int32>::vlanes(), v_expand_low(v_reinterpret_as_s16(x1h)));
-                        v_store(dst + i + 3*VTraits<v_int32>::vlanes(), v_expand_high(v_reinterpret_as_s16(x1h)));
+                        v_uint16 c0, c1, a0, a1, b0, b1, d0, d1, e0, e1;
+                        v_expand(vx_load(src), c0, c1);
+                        v_expand(vx_load(src - cn), a0, a1);
+                        v_expand(vx_load(src + cn), b0, b1);
+                        v_expand(vx_load(src - 2*cn), d0, d1);
+                        v_expand(vx_load(src + 2*cn), e0, e1);
+
+                        v_int16 sl = v_add_wrap(v_add_wrap(v_mul_wrap(v_reinterpret_as_s16(c0), k0),
+                                                           v_mul_wrap(v_reinterpret_as_s16(v_add_wrap(a0, b0)), k1)),
+                                                v_mul_wrap(v_reinterpret_as_s16(v_add_wrap(d0, e0)), k2));
+                        v_int16 sh = v_add_wrap(v_add_wrap(v_mul_wrap(v_reinterpret_as_s16(c1), k0),
+                                                           v_mul_wrap(v_reinterpret_as_s16(v_add_wrap(a1, b1)), k1)),
+                                                v_mul_wrap(v_reinterpret_as_s16(v_add_wrap(d1, e1)), k2));
+
+                        v_store(dst + i, v_expand_low(sl));
+                        v_store(dst + i + VTraits<v_int32>::vlanes(), v_expand_high(sl));
+                        v_store(dst + i + 2*VTraits<v_int32>::vlanes(), v_expand_low(sh));
+                        v_store(dst + i + 3*VTraits<v_int32>::vlanes(), v_expand_high(sh));
                     }
                     if( i <= width - VTraits<v_uint16>::vlanes() )
                     {
-                        v_uint16 x = vx_load_expand(src);
-                        x = v_sub_wrap(v_add_wrap(vx_load_expand(src - 2*cn), vx_load_expand(src + 2*cn)), v_add_wrap(x, x));
-                        v_store(dst + i, v_expand_low(v_reinterpret_as_s16(x)));
-                        v_store(dst + i + VTraits<v_int32>::vlanes(), v_expand_high(v_reinterpret_as_s16(x)));
+                        v_int16 s = v_add_wrap(v_add_wrap(v_mul_wrap(v_reinterpret_as_s16(vx_load_expand(src)), k0),
+                                                          v_mul_wrap(v_reinterpret_as_s16(v_add_wrap(vx_load_expand(src - cn), vx_load_expand(src + cn))), k1)),
+                                               v_mul_wrap(v_reinterpret_as_s16(v_add_wrap(vx_load_expand(src - 2*cn), vx_load_expand(src + 2*cn))), k2));
+                        v_store(dst + i, v_expand_low(s));
+                        v_store(dst + i + VTraits<v_int32>::vlanes(), v_expand_high(s));
                         i += VTraits<v_uint16>::vlanes(); src += VTraits<v_uint16>::vlanes();
                     }
                     if( i <= width - VTraits<v_uint32>::vlanes() )
                     {
-                        v_int32 x = v_reinterpret_as_s32(vx_load_expand_q(src));
-                        x = v_sub(v_reinterpret_as_s32(v_add(vx_load_expand_q(src - 2 * cn), vx_load_expand_q(src + 2 * cn))), v_add(x, x));
-                        v_store(dst + i, x);
+                        v_store(dst + i, v_muladd(v_reinterpret_as_s32(vx_load_expand_q(src)), vx_setall_s32(kx[0]),
+                                         v_muladd(v_reinterpret_as_s32(v_add(vx_load_expand_q(src - cn), vx_load_expand_q(src + cn))), vx_setall_s32(kx[1]),
+                                                  v_mul(v_reinterpret_as_s32(v_add(vx_load_expand_q(src - 2 * cn), vx_load_expand_q(src + 2 * cn))), vx_setall_s32(kx[2])))));
                         i += VTraits<v_uint32>::vlanes();
                     }
                 }
@@ -1258,6 +1304,7 @@ struct SymmRowSmallVec_8u32s
     Mat kernel;
     int symmetryType;
     bool smallValues;
+    bool int16Sums;
 };
 
 
@@ -1457,6 +1504,85 @@ struct SymmColumnVec_32f8u
     }
     int symmetryType;
     float delta;
+    Mat kernel;
+};
+
+struct SymmColumnVec_32s16s
+{
+    SymmColumnVec_32s16s() { symmetryType = 0; delta = 0; }
+    SymmColumnVec_32s16s(const Mat& _kernel, int _symmetryType, int, double _delta)
+    {
+        symmetryType = _symmetryType;
+        kernel = _kernel;
+        delta = saturate_cast<int>(_delta);
+        CV_Assert( (symmetryType & (KERNEL_SYMMETRICAL | KERNEL_ASYMMETRICAL)) != 0 );
+    }
+
+    int operator()(const uchar** _src, uchar* _dst, int width) const
+    {
+        CV_INSTRUMENT_REGION();
+
+        int _ksize = kernel.rows + kernel.cols - 1;
+        if( _ksize == 1 )
+            return 0;
+        int ksize2 = _ksize/2;
+        const int* ky = kernel.ptr<int>() + ksize2;
+        int i = 0, k;
+        bool symmetrical = (symmetryType & KERNEL_SYMMETRICAL) != 0;
+        const int** src = (const int**)_src;
+        short* dst = (short*)_dst;
+
+        const int step = VTraits<v_int32>::vlanes();
+        v_int32 d4 = vx_setall_s32(delta);
+
+        if( symmetrical )
+        {
+            v_int32 f0 = vx_setall_s32(ky[0]);
+            for( ; i <= width - 2*VTraits<v_int16>::vlanes(); i += 2*VTraits<v_int16>::vlanes() )
+            {
+                const int* S = src[0] + i;
+                v_int32 s0 = v_muladd(vx_load(S), f0, d4);
+                v_int32 s1 = v_muladd(vx_load(S + step), f0, d4);
+                v_int32 s2 = v_muladd(vx_load(S + 2*step), f0, d4);
+                v_int32 s3 = v_muladd(vx_load(S + 3*step), f0, d4);
+                for( k = 1; k <= ksize2; k++ )
+                {
+                    v_int32 f = vx_setall_s32(ky[k]);
+                    const int* S0 = src[k] + i;
+                    const int* S1 = src[-k] + i;
+                    s0 = v_muladd(v_add(vx_load(S0), vx_load(S1)), f, s0);
+                    s1 = v_muladd(v_add(vx_load(S0 + step), vx_load(S1 + step)), f, s1);
+                    s2 = v_muladd(v_add(vx_load(S0 + 2*step), vx_load(S1 + 2*step)), f, s2);
+                    s3 = v_muladd(v_add(vx_load(S0 + 3*step), vx_load(S1 + 3*step)), f, s3);
+                }
+                v_store(dst + i, v_pack(s0, s1));
+                v_store(dst + i + VTraits<v_int16>::vlanes(), v_pack(s2, s3));
+            }
+        }
+        else
+        {
+            for( ; i <= width - 2*VTraits<v_int16>::vlanes(); i += 2*VTraits<v_int16>::vlanes() )
+            {
+                v_int32 s0 = d4, s1 = d4, s2 = d4, s3 = d4;
+                for( k = 1; k <= ksize2; k++ )
+                {
+                    v_int32 f = vx_setall_s32(ky[k]);
+                    const int* S0 = src[k] + i;
+                    const int* S1 = src[-k] + i;
+                    s0 = v_muladd(v_sub(vx_load(S0), vx_load(S1)), f, s0);
+                    s1 = v_muladd(v_sub(vx_load(S0 + step), vx_load(S1 + step)), f, s1);
+                    s2 = v_muladd(v_sub(vx_load(S0 + 2*step), vx_load(S1 + 2*step)), f, s2);
+                    s3 = v_muladd(v_sub(vx_load(S0 + 3*step), vx_load(S1 + 3*step)), f, s3);
+                }
+                v_store(dst + i, v_pack(s0, s1));
+                v_store(dst + i + VTraits<v_int16>::vlanes(), v_pack(s2, s3));
+            }
+        }
+        return i;
+    }
+
+    int symmetryType;
+    int delta;
     Mat kernel;
 };
 
@@ -2625,6 +2751,7 @@ typedef SymmRowSmallNoVec SymmRowSmallVec_8u32s;
 typedef SymmRowSmallNoVec SymmRowSmallVec_32f;
 typedef ColumnNoVec SymmColumnVec_32s8u;
 typedef ColumnNoVec SymmColumnVec_32f8u;
+typedef ColumnNoVec SymmColumnVec_32s16s;
 typedef ColumnNoVec SymmColumnVec_32f16s;
 typedef ColumnNoVec SymmColumnVec_32f;
 typedef SymmColumnSmallNoVec SymmColumnSmallVec_32s16s;
@@ -3332,8 +3459,9 @@ Ptr<BaseColumnFilter> getLinearColumnFilter(
             return makePtr<SymmColumnFilter<Cast<double, ushort>, ColumnNoVec> >
                 (kernel, anchor, delta, symmetryType);
         if( ddepth == CV_16S && sdepth == CV_32S )
-            return makePtr<SymmColumnFilter<Cast<int, short>, ColumnNoVec> >
-                (kernel, anchor, delta, symmetryType);
+            return makePtr<SymmColumnFilter<Cast<int, short>, SymmColumnVec_32s16s> >
+                (kernel, anchor, delta, symmetryType, Cast<int, short>(),
+                SymmColumnVec_32s16s(kernel, symmetryType, bits, delta));
         if( ddepth == CV_16S && sdepth == CV_32F )
             return makePtr<SymmColumnFilter<Cast<float, short>, SymmColumnVec_32f16s> >
                  (kernel, anchor, delta, symmetryType, Cast<float, short>(),

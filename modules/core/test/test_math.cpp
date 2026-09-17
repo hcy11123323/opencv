@@ -2698,13 +2698,13 @@ TEST(Core_SolvePoly, degree_2_polynomials)
     cv::Mat_<float> coefs(1,3);
     cv::Mat r;
     double prec;
-    for (int c0 = -20; c0 <= 20; c0++)
+    for (float c0 = -20; c0 <= 20; c0++)
     {
         coefs.at<float>(0) = c0;
-        for (int c1 = -20; c1 <= 20; c1++)
+        for (float c1 = -20; c1 <= 20; c1++)
         {
             coefs.at<float>(1) = c1;
-            for (int c2 = -20; c2 <= 20; c2++)
+            for (float c2 = -20; c2 <= 20; c2++)
             {
                 coefs.at<float>(2) = c2;
                 prec = cv::solvePoly(coefs, r);
@@ -2721,19 +2721,19 @@ TEST(Core_SolvePoly, degree_4_polynomials)
     cv::Mat_<float> coefs(1,5);
     cv::Mat r;
     double prec;
-    for (int c0 = -10; c0 <= 10; c0++)
+    for (float c0 = -10; c0 <= 10; c0++)
     {
         coefs.at<float>(0) = c0;
-        for (int c1 = -10; c1 <= 10; c1++)
+        for (float c1 = -10; c1 <= 10; c1++)
         {
             coefs.at<float>(1) = c1;
-            for (int c2 = -10; c2 <= 10; c2++)
+            for (float c2 = -10; c2 <= 10; c2++)
             {
                 coefs.at<float>(2) = c2;
-                for (int c3 = -10; c3 <= 10; c3++)
+                for (float c3 = -10; c3 <= 10; c3++)
                 {
                     coefs.at<float>(3) = c3;
-                    for (int c4 = -10; c4 <= 10; c4++)
+                    for (float c4 = -10; c4 <= 10; c4++)
                     {
                         coefs.at<float>(4) = c4;
                         prec = cv::solvePoly(coefs, r);
@@ -2750,15 +2750,15 @@ TEST(Core_SolvePoly, different_magnitudes_polynomials)
     cv::Mat_<float> coefs(1,3);
     cv::Mat r;
     double prec;
-    for (int i = -10; i < 10; i++)
+    for (float i = -10; i < 10; i++)
     {
-        coefs.at<float>(0) = pow(2, i);
-        for (int j = -10; j < 10; j++)
+        coefs.at<float>(0) = pow(2.f, i);
+        for (float j = -10; j < 10; j++)
         {
-            coefs.at<float>(1) = pow(2, j);
-            for (int k = -10; k < 10; k++)
+            coefs.at<float>(1) = pow(2.f, j);
+            for (float k = -10; k < 10; k++)
             {
-                coefs.at<float>(2) = pow(2, k);
+                coefs.at<float>(2) = pow(2.f, k);
                 prec = cv::solvePoly(coefs, r);
                 EXPECT_LE(prec, 1e-6);
             }
@@ -4487,6 +4487,110 @@ testing::Values(
                       INT_MAX, INT_MAX, INT_MAX,
                       INT_MIN)
 ));
+
+///////////////////////////////////////////////////////////////////////////////////////////
+
+typedef testing::TestWithParam<MatDepth> Core_PatchNaNs;
+
+static float randomNanFlt(RNG& rng)
+{
+    uint32_t r = rng.next();
+    Cv32suf v;
+    v.u = r;
+    // set the exponent and one mantissa bit to get a NaN (and not an infinity)
+    v.u = v.u | 0x7f800001;
+    return v.f;
+}
+
+static double randomNanDbl(RNG& rng)
+{
+    uint32_t r0 = rng.next();
+    uint32_t r1 = rng.next();
+    Cv64suf v;
+    v.u = (uint64_t(r0) << 32) | uint64_t(r1);
+    // set the exponent and one mantissa bit to get a NaN (and not an infinity)
+    v.u = v.u | 0x7ff0000000000001;
+    return v.f;
+}
+
+static void fillReferenceWithNans(cv::RNG& rng, const Size& sz, int type, double val, cv::Mat& in, cv::Mat& gold)
+{
+    in.create(sz, type);
+    gold.create(sz, type);
+
+    for( int i = 0; i < in.rows; i++ )
+    {
+        for( int j = 0; j < in.cols; j++ )
+        {
+            if (CV_MAT_DEPTH(type) == CV_64F)
+            {
+                switch( rng.uniform(0, 4) )
+                {
+                    case 0:
+                        in.at<double>(i, j) = randomNanDbl(rng);
+                        gold.at<double>(i, j) = val;
+                        break;
+                    case 1:
+                        in.at<double>(i, j) = std::numeric_limits<double>::infinity();
+                        gold.at<double>(i, j) =  in.at<double>(i, j);
+                        break;
+                    case 2:
+                        in.at<double>(i, j) = -std::numeric_limits<double>::infinity();
+                        gold.at<double>(i, j) = in.at<double>(i, j);
+                        break;
+
+                    default:
+                        in.at<double>(i, j) = rng.uniform(-100.0, 100.0);
+                        gold.at<double>(i, j) = in.at<double>(i, j);
+                        break;
+                }
+            }
+            if (CV_MAT_DEPTH(type) == CV_32F)
+            {
+                switch( rng.uniform(0, 4) )
+                {
+                    case 0:
+                        in.at<float>(i, j) = randomNanFlt(rng);
+                        gold.at<float>(i, j) = static_cast<float>(val);
+                        break;
+                    case 1:
+                        in.at<float>(i, j) = std::numeric_limits<float>::infinity();
+                        gold.at<float>(i, j) =  in.at<float>(i, j);
+                        break;
+                    case 2:
+                        in.at<float>(i, j) = -std::numeric_limits<float>::infinity();
+                        gold.at<float>(i, j) = in.at<float>(i, j);
+                        break;
+
+                    default:
+                        in.at<float>(i, j) = rng.uniform(-100.0f, 100.0f);
+                        gold.at<float>(i, j) = in.at<float>(i, j);
+                        break;
+                }
+            }
+        }
+    }
+}
+
+TEST_P(Core_PatchNaNs, accuracy)
+{
+    const int depth = GetParam();
+    cv::Mat in, out, gold;
+    fillReferenceWithNans(theRNG(), cv::Size(127, 71), CV_MAKE_TYPE(depth, 1), 142., in, gold);
+    cv::patchNaNs(in, 142.);
+    // bit-exact check independant from
+    cv::Mat in_bin(in.rows, static_cast<int>(in.cols*in.elemSize()), CV_8UC1, in.data);
+    cv::Mat gold_bin(gold.rows, static_cast<int>(gold.cols*gold.elemSize()), CV_8UC1, gold.data);
+    EXPECT_EQ(0, cvtest::norm(gold_bin, in_bin, cv::NORM_INF));
+}
+
+TEST(Core_PatchNaNs_UnsupportedDepth, accuracy)
+{
+    Mat src(3, 3, CV_16F);
+    EXPECT_THROW(patchNaNs(src, 0), cv::Exception);
+}
+
+INSTANTIATE_TEST_CASE_P(/* */, Core_PatchNaNs, testing::Values(CV_32F, CV_64F));
 
 }} // namespace
 /* End of file. */

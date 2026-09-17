@@ -881,7 +881,8 @@ CV_EXPORTS_W Vec3d RQDecomp3x3( InputArray src, OutputArray mtxR, OutputArray mt
 @param projMatrix 3x4 input projection matrix P.
 @param cameraMatrix Output 3x3 camera intrinsic matrix \f$\cameramatrix{A}\f$.
 @param rotMatrix Output 3x3 external rotation matrix R.
-@param transVect Output 4x1 translation vector T.
+@param transVect Output 4x1 vector representing the camera position in homogeneous coordinates.
+To obtain the translation vector, use t = -rotMatrix * transVect[:3].
 @param rotMatrixX Optional 3x3 rotation matrix around x-axis.
 @param rotMatrixY Optional 3x3 rotation matrix around y-axis.
 @param rotMatrixZ Optional 3x3 rotation matrix around z-axis.
@@ -3853,6 +3854,11 @@ map_y(u,v)  \leftarrow y''' f_y + c_y
 \f]
 where \f$(k_1, k_2, p_1, p_2[, k_3[, k_4, k_5, k_6[, s_1, s_2, s_3, s_4[, \tau_x, \tau_y]]]])\f$
 are the distortion coefficients.
+
+@note The rational distortion model used by OpenCV can be seen as a
+combination of the Brown-Conrady Model and the Division Model @cite Fitzgibbon01.
+It should not be confused with the Rational Function Model @cite Claus05a, which
+uses conics to represent lens distortion.
 
 In case of a stereo camera, this function is called twice: once for each camera head, after
 #stereoRectify, which in its turn is called after #stereoCalibrate. But if the stereo camera

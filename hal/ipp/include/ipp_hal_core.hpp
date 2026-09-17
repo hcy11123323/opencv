@@ -12,8 +12,10 @@
 int ipp_hal_meanStdDev(const uchar* src_data, size_t src_step, int width, int height, int src_type,
                        double* mean_val, double* stddev_val, uchar* mask, size_t mask_step);
 
-#undef cv_hal_meanStdDev
-#define cv_hal_meanStdDev ipp_hal_meanStdDev
+// IPP version is less efficient than implementation with universtal intrinsics
+// See https://github.com/opencv/opencv/pull/29339
+//#undef cv_hal_meanStdDev
+//#define cv_hal_meanStdDev ipp_hal_meanStdDev
 
 int ipp_hal_minMaxIdxMaskStep(const uchar* src_data, size_t src_step, int width, int height, int depth,
                               double* _minVal, double* _maxVal, int* _minIdx, int* _maxIdx, uchar* mask, size_t mask_step);
@@ -31,6 +33,14 @@ int ipp_hal_minMaxIdxMaskStep(const uchar* src_data, size_t src_step, int width,
 # define IPP_DISABLE_NORM_INF_16U_C1MR   1 // segmentation fault in accuracy test
 # else
 # define IPP_DISABLE_NORM_INF_16U_C1MR   0
+#endif
+
+// segmentation fault in ippiNorm[Diff]_Inf_32f_C3CMR with the macOS ippicv (2021.9.1);
+// the newer Linux/Windows ippicv (2026.0.0) is not affected
+#if defined(__APPLE__)
+# define IPP_DISABLE_NORM_INF_32F_C3CMR  1
+# else
+# define IPP_DISABLE_NORM_INF_32F_C3CMR  0
 #endif
 
 int ipp_hal_norm(const uchar* src, size_t src_step, const uchar* mask, size_t mask_step,
@@ -73,6 +83,33 @@ int ipp_hal_transpose2d(const uchar* src_data, size_t src_step, uchar* dst_data,
 
 #undef cv_hal_transpose2d
 #define cv_hal_transpose2d ipp_hal_transpose2d
+
+int ipp_hal_invSqrt32f(const float* src, float* dst, int len);
+int ipp_hal_invSqrt64f(const double* src, double* dst, int len);
+
+#undef cv_hal_invSqrt32f
+#define cv_hal_invSqrt32f ipp_hal_invSqrt32f
+
+#undef cv_hal_invSqrt64f
+#define cv_hal_invSqrt64f ipp_hal_invSqrt64f
+
+int ipp_hal_exp32f(const float* src, float* dst, int len);
+int ipp_hal_exp64f(const double* src, double* dst, int len);
+
+#undef cv_hal_exp32f
+#define cv_hal_exp32f ipp_hal_exp32f
+
+#undef cv_hal_exp64f
+#define cv_hal_exp64f ipp_hal_exp64f
+
+int ipp_hal_log32f(const float* src, float* dst, int len);
+int ipp_hal_log64f(const double* src, double* dst, int len);
+
+#undef cv_hal_log32f
+#define cv_hal_log32f ipp_hal_log32f
+
+#undef cv_hal_log64f
+#define cv_hal_log64f ipp_hal_log64f
 
 //! @endcond
 

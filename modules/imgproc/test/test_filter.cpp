@@ -11,6 +11,7 @@
 //                For Open Source Computer Vision Library
 //
 // Copyright (C) 2000, Intel Corporation, all rights reserved.
+// Copyright (C) 2026, Advanced Micro Devices, Inc., all rights reserved.
 // Third party copyrights are property of their respective owners.
 //
 // Redistribution and use in source and binary forms, with or without modification,
@@ -601,8 +602,10 @@ void CV_SpatialGradientTest::get_test_array_types_and_sizes( int test_case_idx,
 
 void CV_SpatialGradientTest::run_func()
 {
-    spatialGradient( test_mat[INPUT][0], test_mat[OUTPUT][0],
-                     test_mat[OUTPUT][1], ksize, border );
+    Mat dx, dy;
+    spatialGradient( test_mat[INPUT][0], dx, dy, ksize, border );
+    dx.copyTo( test_mat[OUTPUT][0] );
+    dy.copyTo( test_mat[OUTPUT][1] );
 }
 
 void CV_SpatialGradientTest::prepare_to_validation( int /*test_case_idx*/ )
@@ -1868,6 +1871,155 @@ TEST(Imgproc_MorphologyEx, accuracy) { CV_MorphExTest test; test.safe_run(); }
 TEST(Imgproc_Filter2D, accuracy) { CV_FilterTest test; test.safe_run(); }
 TEST(Imgproc_Sobel, accuracy) { CV_SobelTest test; test.safe_run(); }
 TEST(Imgproc_SpatialGradient, accuracy) { CV_SpatialGradientTest test; test.safe_run(); }
+
+// spatialGradient (fused dx+dy) must match the two separate cv::Sobel calls it fuses:
+// bit-exact for ddepth=CV_16S/scale=1 and ddepth=CV_32F (scale folded into kernels like cv::Sobel).
+typedef tuple<int, double> SpatialGradientFusedDepthScale_t;
+typedef tuple<int, int, int, SpatialGradientFusedDepthScale_t> SpatialGradientFusedParams_t;
+typedef TestWithParam<SpatialGradientFusedParams_t> Imgproc_SpatialGradient_Fused;
+
+TEST_P(Imgproc_SpatialGradient_Fused, fused_accuracy)
+{
+    const int iter = get<0>(GetParam());
+    const int ksize = get<1>(GetParam());
+    const int border = get<2>(GetParam());
+    const int ddepth = get<0>(get<3>(GetParam()));
+    const double scale = get<1>(get<3>(GetParam()));
+
+    RNG& rng = TS::ptr()->get_rng();
+    rng.state += iter;
+    Size sz(rng.uniform(3, 320), rng.uniform(3, 240));
+    Mat src(sz, CV_8UC1);
+    rng.fill(src, RNG::UNIFORM, 0, 256);
+
+    Mat dx, dy, dxRef, dyRef;
+    spatialGradient(src, dx, dy, ksize, border, ddepth, scale);
+    Sobel(src, dxRef, ddepth, 1, 0, ksize, scale, 0, border);
+    Sobel(src, dyRef, ddepth, 0, 1, ksize, scale, 0, border);
+
+    EXPECT_EQ(CV_MAKETYPE(ddepth, 1), dx.type());
+    EXPECT_EQ(sz, dx.size());
+    const double tol = 0.0;
+    EXPECT_LE(cvtest::norm(dx, dxRef, NORM_INF), tol);
+    EXPECT_LE(cvtest::norm(dy, dyRef, NORM_INF), tol);
+}
+
+INSTANTIATE_TEST_CASE_P(/**/, Imgproc_SpatialGradient_Fused,
+    testing::Combine(
+        testing::Range(0, 16),
+        testing::Values(3, 5),
+        testing::Values(BORDER_DEFAULT, BORDER_REPLICATE, BORDER_REFLECT,
+                        BORDER_REFLECT_101, BORDER_CONSTANT),
+        testing::Values(
+            make_tuple(CV_16S, 1.0),
+            make_tuple(CV_32F, 1.0),
+            make_tuple(CV_32F, 0.25)
+        )
+    )
+);
+
+TEST(Imgproc_SpatialGradient, fused_accuracy)
+{
+    RNG& rng = TS::ptr()->get_rng();
+
+    // CV_32FC1 source must work via the fallback and match cv::Sobel.
+    {
+        Mat src(120, 90, CV_32FC1);
+        rng.fill(src, RNG::UNIFORM, -5.f, 5.f);
+        for (int ks : {3, 5})
+        {
+            Mat dx, dy, dxRef, dyRef;
+            spatialGradient(src, dx, dy, ks, BORDER_DEFAULT, CV_32F);
+            Sobel(src, dxRef, CV_32F, 1, 0, ks, 1, 0, BORDER_DEFAULT);
+            Sobel(src, dyRef, CV_32F, 0, 1, ks, 1, 0, BORDER_DEFAULT);
+            EXPECT_LE(cvtest::norm(dx, dxRef, NORM_INF), 1e-4) << "float-src dx ksize=" << ks;
+            EXPECT_LE(cvtest::norm(dy, dyRef, NORM_INF), 1e-4) << "float-src dy ksize=" << ks;
+        }
+    }
+
+    // full-width row-range ROI (as Canny uses): must match cv::Sobel on the ROI.
+    {
+        Mat parent(200, 160, CV_8UC1);
+        rng.fill(parent, RNG::UNIFORM, 0, 256);
+        for (int ks : {1, 3, 5})
+            for (int b : {BORDER_DEFAULT, BORDER_REPLICATE, BORDER_REFLECT, BORDER_CONSTANT})
+                for (int ddepth : {CV_16S, CV_32F})
+                {
+                    Mat roi = parent.rowRange(40, 120);
+                    Mat dx, dy, dxRef, dyRef;
+                    spatialGradient(roi, dx, dy, ks, b, ddepth);
+                    Sobel(roi, dxRef, ddepth, 1, 0, ks, 1, 0, b);
+                    Sobel(roi, dyRef, ddepth, 0, 1, ks, 1, 0, b);
+                    EXPECT_LE(cvtest::norm(dx, dxRef, NORM_INF), 0.0) << "ROI dx ksize=" << ks << " border=" << b << " ddepth=" << ddepth;
+                    EXPECT_LE(cvtest::norm(dy, dyRef, NORM_INF), 0.0) << "ROI dy ksize=" << ks << " border=" << b << " ddepth=" << ddepth;
+                }
+    }
+
+    // invalid aperture sizes must be rejected
+    Mat src(16, 16, CV_8UC1), dx, dy;
+    EXPECT_ANY_THROW(spatialGradient(src, dx, dy, 2));
+}
+
+// Reproduces parallelCanny's per-slice row splitting and checks each slice's
+// spatialGradient output matches the whole-image gradient (i.e. multi-threaded == single).
+typedef tuple<int, int> SpatialGradientSliceThread_t;
+typedef tuple<int, int, SpatialGradientSliceThread_t> SpatialGradientSliceParams_t;
+typedef TestWithParam<SpatialGradientSliceParams_t> Imgproc_SpatialGradient_Slice;
+
+TEST_P(Imgproc_SpatialGradient_Slice, slice_equivalence)
+{
+    const int ksize = get<0>(GetParam());
+    const int border = get<1>(GetParam());
+    const int nThreads = get<0>(get<2>(GetParam()));
+    const int t = get<1>(get<2>(GetParam()));
+
+    Mat src(193, 137, CV_8UC1);   // odd dims to stress tail handling
+    RNG& rng = TS::ptr()->get_rng();
+    rng.state += (int)((int64)ksize * 10000 + border * 1000 + nThreads * 100 + t);
+    rng.fill(src, RNG::UNIFORM, 0, 256);
+
+    Mat dxRef, dyRef;
+    spatialGradient(src, dxRef, dyRef, ksize, border);
+
+    const int start = (int)((int64)src.rows * t / nThreads);
+    const int end   = (int)((int64)src.rows * (t + 1) / nThreads);
+    if (start >= end)
+        return;
+
+    const int rowStart = std::max(0, start - 1);
+    const int rowEnd   = std::min(src.rows, end + 1);
+
+    Mat dx, dy;
+    spatialGradient(src.rowRange(rowStart, rowEnd), dx, dy, ksize, border);
+
+    // rows [start, end) live at offset (start - rowStart) in the slice output
+    const int off = start - rowStart;
+    Mat dxSlice = dx.rowRange(off, off + (end - start));
+    Mat dySlice = dy.rowRange(off, off + (end - start));
+    Mat dxWhole = dxRef.rowRange(start, end);
+    Mat dyWhole = dyRef.rowRange(start, end);
+
+    EXPECT_EQ(0.0, cvtest::norm(dxSlice, dxWhole, NORM_INF));
+    EXPECT_EQ(0.0, cvtest::norm(dySlice, dyWhole, NORM_INF));
+}
+
+INSTANTIATE_TEST_CASE_P(/**/, Imgproc_SpatialGradient_Slice,
+    testing::Combine(
+        testing::Values(3, 5),
+        testing::Values(BORDER_REPLICATE, BORDER_REFLECT, BORDER_REFLECT_101),
+        testing::Values(
+            make_tuple(2, 0), make_tuple(2, 1),
+            make_tuple(3, 0), make_tuple(3, 1), make_tuple(3, 2),
+            make_tuple(4, 0), make_tuple(4, 1), make_tuple(4, 2), make_tuple(4, 3),
+            make_tuple(7, 0), make_tuple(7, 1), make_tuple(7, 2), make_tuple(7, 3),
+            make_tuple(7, 4), make_tuple(7, 5), make_tuple(7, 6),
+            make_tuple(16, 0), make_tuple(16, 1), make_tuple(16, 2), make_tuple(16, 3),
+            make_tuple(16, 4), make_tuple(16, 5), make_tuple(16, 6), make_tuple(16, 7),
+            make_tuple(16, 8), make_tuple(16, 9), make_tuple(16, 10), make_tuple(16, 11),
+            make_tuple(16, 12), make_tuple(16, 13), make_tuple(16, 14), make_tuple(16, 15)
+        )
+    )
+);
 TEST(Imgproc_Laplace, accuracy) { CV_LaplaceTest test; test.safe_run(); }
 TEST(Imgproc_Blur, accuracy) { CV_BlurTest test; test.safe_run(); }
 TEST(Imgproc_GaussianBlur, accuracy) { CV_GaussianBlurTest test; test.safe_run(); }
@@ -1937,6 +2089,44 @@ INSTANTIATE_TEST_CASE_P(/**/, Imgproc_FilterSupportedFormats,
         make_pair( CV_16S, CV_64F),
         make_pair( CV_32F, CV_32F),
         make_pair( CV_64F, CV_64F)
+    )
+);
+
+typedef tuple<perf::MatDepth, int, perf::MatType> Filter2DIntegerKernelParams;
+typedef testing::TestWithParam<Filter2DIntegerKernelParams> Imgproc_Filter2D_IntegerKernel;
+
+TEST_P(Imgproc_Filter2D_IntegerKernel, accuracy)
+{
+    const int kernelDepth = get<0>(GetParam());
+    const int kernelSize = get<1>(GetParam());
+    const int srcType = get<2>(GetParam());
+    const int dstDepth = CV_MAT_DEPTH(srcType) == CV_64F ? CV_64F : CV_32F;
+
+    RNG& rng = theRNG();
+    Mat src(47, 53, srcType);
+    rng.fill(src, RNG::UNIFORM, 0, 16);
+
+    Mat coefficients(kernelSize, kernelSize, CV_32S), kernel, referenceKernel;
+    const bool unsignedKernel = kernelDepth == CV_8U || kernelDepth == CV_16U;
+    rng.fill(coefficients, RNG::UNIFORM, unsignedKernel ? 0 : -4, 5);
+    coefficients.convertTo(kernel, kernelDepth);
+    coefficients.convertTo(referenceKernel, CV_64F);
+
+    Mat actual, expected;
+    cv::filter2D(src, actual, dstDepth, kernel, Point(-1, -1), 0, BORDER_REPLICATE);
+    cvtest::filter2D(src, expected, dstDepth, referenceKernel, Point(-1, -1), 0,
+                     BORDER_REPLICATE);
+
+    ASSERT_EQ(expected.type(), actual.type());
+    ASSERT_EQ(expected.size(), actual.size());
+    EXPECT_LE(cvtest::norm(actual, expected, NORM_INF), dstDepth == CV_64F ? 1e-9 : 1e-3);
+}
+
+INSTANTIATE_TEST_CASE_P(/**/, Imgproc_Filter2D_IntegerKernel,
+    testing::Combine(
+        testing::Values(CV_8U, CV_8S, CV_16U, CV_16S, CV_32S),
+        testing::Values(3, 13),
+        testing::Values(CV_8UC1, CV_32FC1, CV_32FC3, CV_64FC1)
     )
 );
 
@@ -2275,6 +2465,42 @@ TEST(Imgproc_MedianBlur, regression_28385)
     // this crashes in case of overflow because of out-of-bounds memory access
     medianBlur(sub, out, 3);
     ASSERT_EQ(out.size(), Size(100, 50000));
+}
+
+// Regression test for https://github.com/opencv/opencv/issues/29592
+// medianBlur used to reject CV_8U images with channel counts other than
+// 1, 3 or 4 whenever the large-kernel path was needed (ksize >= 7, or
+// ksize == 5 on SIMD-enabled builds). Any channel count should now work,
+// and must match filtering each channel independently.
+TEST(Imgproc_MedianBlur, arbitrary_channel_count_29592)
+{
+    const int channelCounts[] = { 1, 2, 3, 4, 5, 6, 9 };
+    const int ksizes[] = { 3, 5, 7, 9 };
+
+    for (int cn : channelCounts)
+    {
+        Mat src(17, 19, CV_MAKETYPE(CV_8U, cn));
+        randu(src, 0, 256);
+
+        std::vector<Mat> srcChannels;
+        cv::split(src, srcChannels);
+
+        for (int ksize : ksizes)
+        {
+            Mat dst;
+            ASSERT_NO_THROW(medianBlur(src, dst, ksize)) << "cn=" << cn << " ksize=" << ksize;
+            ASSERT_EQ(dst.size(), src.size());
+            ASSERT_EQ(dst.type(), src.type());
+
+            std::vector<Mat> dstChannels(srcChannels.size());
+            for (size_t i = 0; i < srcChannels.size(); i++)
+                medianBlur(srcChannels[i], dstChannels[i], ksize);
+            Mat expected;
+            cv::merge(dstChannels, expected);
+
+            EXPECT_EQ(0.0, cvtest::norm(dst, expected, NORM_INF)) << "cn=" << cn << " ksize=" << ksize;
+        }
+    }
 }
 
 TEST(Imgproc_Sobel, s16_regression_13506)
@@ -2739,5 +2965,62 @@ TEST(Imgproc_Filter2D, padding_bounds_roi_isolated)
         }
     }
 }
+
+class FastFilterEngineTest : public ::testing::Test {
+  protected:
+      void SetUp() override {
+          // Prepare separable kernels (3x3 averaging filter [1, 1, 1]).
+          kX = cv::Mat::ones(1, 3, CV_32F) / 3.0f;
+          kY = cv::Mat::ones(3, 1, CV_32F) / 3.0f;
+      }
+
+      cv::Mat kX, kY;
+};
+
+TEST_F(FastFilterEngineTest, Submatrix) {
+    // num_threads == 2 triggers the fast path.
+    for(int num_threads : {1, 2}) {
+        setNumThreads(num_threads);
+        Mat1b parent(1200, 1200, 255);
+        Mat roi = parent(Rect(100, 100, 1024, 1024));
+        roi.setTo(Scalar(0));
+        Mat dst;
+
+        sepFilter2D(roi, dst, -1, kX, kY, Point(-1, -1), 0, BORDER_REPLICATE);
+
+        // Before fix in fast path: dst.at<uchar>(0,0) == 0 (treated as isolated).
+        // With fix in fast path: dst.at<uchar>(0,0) > 0 (correctly reads 255 padding from parent).
+        EXPECT_GT(dst.at<uchar>(0, 0), 0);
+
+        // Filter in-place directly into 'roi' (dst == roi).
+        sepFilter2D(roi, roi, -1, kX, kY, Point(-1, -1), 0, BORDER_REPLICATE);
+
+        // Before fix in fast path: roi.at<uchar>(0,0) == 0 (cloned only ROI, lost parent padding).
+        // With fix in fast path: roi.at<uchar>(0,0) > 0 (clones required_region including padding).
+        EXPECT_GT(roi.at<uchar>(0, 0), 0);
+    }
+}
+
+TEST_F(FastFilterEngineTest, FullImage) {
+    // num_threads == 2 triggers the fast path.
+    for(int num_threads : {1, 2}) {
+        setNumThreads(num_threads);
+        Mat1b img(1024, 1024, 100);
+
+        Mat dst;
+
+        sepFilter2D(img, dst, -1, kX, kY, Point(-1, -1), 0, BORDER_REPLICATE);
+
+        // Verifies direct pass-through (src_copy = src) executes correctly.
+        EXPECT_EQ(dst.at<uchar>(0, 0), 100);
+
+        // Filter in-place directly into 'img' (dst == img).
+        sepFilter2D(img, img, -1, kX, kY, Point(-1, -1), 0, BORDER_REPLICATE);
+
+        // Verifies that full-image cloning (src.clone()) executes correctly without memory corruption.
+        EXPECT_EQ(img.at<uchar>(0, 0), 100);
+    }
+}
+
 
 }} // namespace

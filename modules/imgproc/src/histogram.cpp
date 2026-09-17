@@ -260,16 +260,74 @@ calcHist_( std::vector<uchar*>& _ptrs, const std::vector<int>& _deltas,
             for( ; imsize.height--; p0 += step0, mask += mstep )
             {
                 if( !mask )
-                    for( x = 0; x < imsize.width; x++, p0 += d0 )
+                {
+#if (CV_SIMD || CV_SIMD_SCALABLE)
+                    if( d0 == 1 && sizeof(T) == 2 )
                     {
-                        double v0 = (double)*p0;
-                        int idx = cvFloor(v0*a + b);
-                        if (v0 < v0_lo || v0 >= v0_hi)
-                            continue;
-                        idx = CV_CLAMP_INT(idx, 0, sz - 1);
-                        CV_DbgAssert((unsigned)idx < (unsigned)sz);
-                        ((int*)H)[idx]++;
+                        const ushort* p  = (const ushort*)p0;
+                        const int nlanes = VTraits<v_uint16>::vlanes();
+
+                        const v_float32 va   = vx_setall_f32((float)a);
+                        const v_float32 vb   = vx_setall_f32((float)b);
+                        const v_float32 vlo  = vx_setall_f32((float)v0_lo);
+                        const v_float32 vhi  = vx_setall_f32((float)v0_hi);
+                        const v_int32   vi0  = vx_setall_s32(0);
+                        const v_int32   visz = vx_setall_s32(sz - 1);
+
+                        x = 0;
+                        for( ; x <= imsize.width - nlanes; x += nlanes )
+                        {
+                            v_uint16 pix = vx_load(&p[x]);
+                            v_uint32 lo32, hi32;
+                            v_expand(pix, lo32, hi32);
+                            v_float32 flo = v_cvt_f32(v_reinterpret_as_s32(lo32));
+                            v_float32 fhi = v_cvt_f32(v_reinterpret_as_s32(hi32));
+                            v_uint32 rlo = v_reinterpret_as_u32(v_and(v_ge(flo, vlo), v_lt(flo, vhi)));
+                            v_uint32 rhi = v_reinterpret_as_u32(v_and(v_ge(fhi, vlo), v_lt(fhi, vhi)));
+
+                            v_int32 idx_lo = v_max(vi0, v_min(visz, v_floor(v_fma(flo, va, vb))));
+                            v_int32 idx_hi = v_max(vi0, v_min(visz, v_floor(v_fma(fhi, va, vb))));
+
+                            int idxbuf[2 * VTraits<v_int32>::max_nlanes];
+                            v_store(idxbuf, idx_lo);
+                            v_store(idxbuf + nlanes / 2, idx_hi);
+
+                            if( v_check_all(v_reinterpret_as_s32(rlo)) && v_check_all(v_reinterpret_as_s32(rhi)) )
+                            {
+                                for( int k = 0; k < nlanes; k++ )
+                                    ((int*)H)[idxbuf[k]]++;
+                            }
+                            else
+                            {
+                                int deltabuf[2 * VTraits<v_int32>::max_nlanes];
+                                v_store(deltabuf, v_reinterpret_as_s32(rlo));
+                                v_store(deltabuf + nlanes / 2, v_reinterpret_as_s32(rhi));
+                                for( int k = 0; k < nlanes; k++ )
+                                    ((int*)H)[idxbuf[k]] += (deltabuf[k] != 0);
+                            }
+                        }
+                        for( ; x < imsize.width; x++ )
+                        {
+                            double v0 = (double)p[x];
+                            int delta = int(v0_lo <= v0) & int(v0 < v0_hi);
+                            int idx   = CV_CLAMP_INT(cvFloor(v0*a + b), 0, sz-1);
+                            ((int*)H)[idx] += delta;
+                        }
+                        p0 = (const T*)(p + imsize.width);
                     }
+                    else
+#endif
+                        for( x = 0; x < imsize.width; x++, p0 += d0 )
+                        {
+                            double v0 = (double)*p0;
+                            int idx = cvFloor(v0*a + b);
+                            if (v0 < v0_lo || v0 >= v0_hi)
+                                continue;
+                            idx = CV_CLAMP_INT(idx, 0, sz - 1);
+                            CV_DbgAssert((unsigned)idx < (unsigned)sz);
+                            ((int*)H)[idx]++;
+                        }
+                }
                 else
                     for( x = 0; x < imsize.width; x++, p0 += d0 )
                         if( mask[x] )
@@ -688,152 +746,6 @@ calcHist_8u( std::vector<uchar*>& _ptrs, const std::vector<int>& _deltas,
     }
 }
 
-#ifdef HAVE_IPP
-
-typedef IppStatus(CV_STDCALL * IppiHistogram_C1)(const void* pSrc, int srcStep,
-    IppiSize roiSize, Ipp32u* pHist, const IppiHistogramSpec* pSpec, Ipp8u* pBuffer);
-
-static IppiHistogram_C1 getIppiHistogramFunction_C1(int type)
-{
-    IppiHistogram_C1 ippFunction =
-        (type == CV_8UC1) ? (IppiHistogram_C1)ippiHistogram_8u_C1R :
-        (type == CV_16UC1) ? (IppiHistogram_C1)ippiHistogram_16u_C1R :
-        (type == CV_32FC1) ? (IppiHistogram_C1)ippiHistogram_32f_C1R :
-        NULL;
-
-    return ippFunction;
-}
-
-class ipp_calcHistParallelTLS
-{
-public:
-    ipp_calcHistParallelTLS() {}
-
-    IppAutoBuffer<IppiHistogramSpec> spec;
-    IppAutoBuffer<Ipp8u>  buffer;
-    IppAutoBuffer<Ipp32u> thist;
-};
-
-class ipp_calcHistParallel: public ParallelLoopBody
-{
-public:
-    ipp_calcHistParallel(const Mat &src, Mat &hist, Ipp32s histSize, const float *ranges, bool uniform, bool &ok):
-        ParallelLoopBody(), m_src(src), m_hist(hist), m_ok(ok)
-    {
-        ok = true;
-
-        m_uniform        = uniform;
-        m_ranges         = ranges;
-        m_histSize       = histSize;
-        m_type           = ippiGetDataType(src.type());
-        m_levelsNum      = histSize+1;
-        ippiHistogram_C1 = getIppiHistogramFunction_C1(src.type());
-        m_fullRoi    = ippiSize(src.size());
-        m_bufferSize = 0;
-        m_specSize   = 0;
-        if(!ippiHistogram_C1)
-        {
-            ok = false;
-            return;
-        }
-
-        if(ippiHistogramGetBufferSize(m_type, m_fullRoi, &m_levelsNum, 1, 1, &m_specSize, &m_bufferSize) < 0)
-        {
-            ok = false;
-            return;
-        }
-
-        hist.setTo(0);
-    }
-
-    virtual void operator() (const Range & range) const CV_OVERRIDE
-    {
-        CV_INSTRUMENT_REGION_IPP();
-
-        if(!m_ok)
-            return;
-
-        ipp_calcHistParallelTLS *pTls = m_tls.get();
-
-        IppiSize roi = {m_src.cols, range.end - range.start };
-        bool     mtLoop = false;
-        if(m_fullRoi.height != roi.height)
-            mtLoop = true;
-
-        if(!pTls->spec)
-        {
-            pTls->spec.allocate(m_specSize);
-            if(!pTls->spec.get())
-            {
-                m_ok = false;
-                return;
-            }
-
-            pTls->buffer.allocate(m_bufferSize);
-            if(!pTls->buffer.get() && m_bufferSize)
-            {
-                m_ok = false;
-                return;
-            }
-
-            if(m_uniform)
-            {
-                if(ippiHistogramUniformInit(m_type, (Ipp32f*)&m_ranges[0], (Ipp32f*)&m_ranges[1], (Ipp32s*)&m_levelsNum, 1, pTls->spec) < 0)
-                {
-                    m_ok = false;
-                    return;
-                }
-            }
-            else
-            {
-                if(ippiHistogramInit(m_type, (const Ipp32f**)&m_ranges, (Ipp32s*)&m_levelsNum, 1, pTls->spec) < 0)
-                {
-                    m_ok = false;
-                    return;
-                }
-            }
-
-            pTls->thist.allocate(m_histSize*sizeof(Ipp32u));
-        }
-
-        if(CV_INSTRUMENT_FUN_IPP(ippiHistogram_C1, m_src.ptr(range.start), (int)m_src.step, roi, pTls->thist, pTls->spec, pTls->buffer) < 0)
-        {
-            m_ok = false;
-            return;
-        }
-
-        if(mtLoop)
-        {
-            for(int i = 0; i < m_histSize; i++)
-                CV_XADD((int*)(m_hist.ptr(i)), *(int*)((Ipp32u*)pTls->thist + i));
-        }
-        else
-            ippiCopy_32s_C1R((Ipp32s*)pTls->thist.get(), sizeof(Ipp32u), (Ipp32s*)m_hist.ptr(), (int)m_hist.step, ippiSize(1, m_histSize));
-    }
-
-private:
-    const Mat      &m_src;
-    Mat            &m_hist;
-    Ipp32s          m_histSize;
-    const float    *m_ranges;
-    bool            m_uniform;
-
-    IppiHistogram_C1    ippiHistogram_C1;
-    IppiSize            m_fullRoi;
-    IppDataType         m_type;
-    Ipp32s              m_levelsNum;
-    int                 m_bufferSize;
-    int                 m_specSize;
-
-    mutable Mutex                    m_syncMutex;
-    TLSData<ipp_calcHistParallelTLS> m_tls;
-
-    volatile bool &m_ok;
-    const ipp_calcHistParallel & operator = (const ipp_calcHistParallel & );
-};
-
-#endif
-
 }
 
 #ifdef HAVE_OPENVX
@@ -894,58 +806,6 @@ namespace cv
 }
 #endif
 
-#ifdef HAVE_IPP
-#define IPP_HISTOGRAM_PARALLEL 1
-namespace cv
-{
-static bool ipp_calchist(const Mat &image, Mat &hist, int histSize, const float** ranges, bool uniform, bool accumulate)
-{
-    CV_INSTRUMENT_REGION_IPP();
-
-#if IPP_VERSION_X100 < 201801
-    // No SSE42 optimization for uniform 32f
-    if(uniform && image.depth() == CV_32F && cv::ipp::getIppTopFeatures() == ippCPUID_SSE42)
-        return false;
-#endif
-
-    // IPP_DISABLE_HISTOGRAM - https://github.com/opencv/opencv/issues/11544
-    // and https://github.com/opencv/opencv/issues/21595
-    if ((uniform && (ranges[0][1] - ranges[0][0]) != histSize) || abs(ranges[0][0]) != cvFloor(ranges[0][0]))
-        return false;
-
-    Mat ihist = hist;
-    if(accumulate)
-        ihist.create(1, &histSize, CV_32S);
-
-    bool  ok      = true;
-    int   threads = ippiSuggestThreadsNum(image, (1+((double)ihist.total()/image.total()))*2);
-    Range range(0, image.rows);
-    ipp_calcHistParallel invoker(image, ihist, histSize, ranges[0], uniform, ok);
-    if(!ok)
-        return false;
-
-    if(IPP_HISTOGRAM_PARALLEL && threads > 1)
-        parallel_for_(range, invoker, threads*2);
-    else
-        invoker(range);
-
-    if(ok)
-    {
-        if(accumulate)
-        {
-            IppiSize histRoi = ippiSize(1, histSize);
-            IppAutoBuffer<Ipp32f> fhist(histSize*sizeof(Ipp32f));
-            CV_INSTRUMENT_FUN_IPP(ippiConvert_32s32f_C1R, (Ipp32s*)ihist.ptr(), (int)ihist.step, (Ipp32f*)fhist, sizeof(Ipp32f), histRoi);
-            CV_INSTRUMENT_FUN_IPP(ippiAdd_32f_C1IR, (Ipp32f*)fhist, sizeof(Ipp32f), (Ipp32f*)hist.ptr(), (int)hist.step, histRoi);
-        }
-        else
-            CV_INSTRUMENT_FUN_IPP(ippiConvert_32s32f_C1R, (Ipp32s*)ihist.ptr(), (int)ihist.step, (Ipp32f*)hist.ptr(), (int)hist.step, ippiSize(1, histSize));
-    }
-    return ok;
-}
-}
-#endif
-
 void cv::calcHist( const Mat* images, int nimages, const int* channels,
                    InputArray _mask, OutputArray _hist, int dims, const int* histSize,
                    const float** ranges, bool uniform, bool accumulate )
@@ -972,11 +832,6 @@ void cv::calcHist( const Mat* images, int nimages, const int* channels,
 
     if(histdata != hist.data)
         accumulate = false;
-
-    CV_IPP_RUN(
-        nimages == 1 && dims == 1 && channels && channels[0] == 0
-            && _mask.empty() && images[0].dims <= 2 && ranges && ranges[0],
-        ipp_calchist(images[0], hist, histSize[0], ranges, uniform, accumulate));
 
     if (nimages == 1 && dims == 1 && channels && channels[0] == 0 && _mask.empty() && images[0].dims <= 2 && ranges && ranges[0]) {
         CALL_HAL(calcHist, cv_hal_calcHist, images[0].data, images[0].step, images[0].type(), images[0].cols, images[0].rows,
@@ -3321,10 +3176,14 @@ private:
     cv::Mutex* histogramLock_;
 };
 
+namespace cv {
+    void equalizeHistLut_dispatch( const uchar* src, uchar* dst, int len, const uchar* lut );
+}
+
 class EqualizeHistLut_Invoker : public cv::ParallelLoopBody
 {
 public:
-    EqualizeHistLut_Invoker( cv::Mat& src, cv::Mat& dst, int* lut )
+    EqualizeHistLut_Invoker( cv::Mat& src, cv::Mat& dst, uchar* lut )
         : src_(src),
           dst_(dst),
           lut_(lut)
@@ -3337,7 +3196,7 @@ public:
 
         int width = src_.cols;
         int height = rowRange.end - rowRange.start;
-        int* lut = lut_;
+        const uchar* lut = lut_;
 
         if (src_.isContinuous() && dst_.isContinuous())
         {
@@ -3350,26 +3209,7 @@ public:
 
         for (; height--; sptr += sstep, dptr += dstep)
         {
-            int x = 0;
-            for (; x <= width - 4; x += 4)
-            {
-                int v0 = sptr[x];
-                int v1 = sptr[x+1];
-                int x0 = lut[v0];
-                int x1 = lut[v1];
-                dptr[x] = (uchar)x0;
-                dptr[x+1] = (uchar)x1;
-
-                v0 = sptr[x+2];
-                v1 = sptr[x+3];
-                x0 = lut[v0];
-                x1 = lut[v1];
-                dptr[x+2] = (uchar)x0;
-                dptr[x+3] = (uchar)x1;
-            }
-
-            for (; x < width; ++x)
-                dptr[x] = (uchar)lut[sptr[x]];
+            cv::equalizeHistLut_dispatch(sptr, dptr, width, lut);
         }
     }
 
@@ -3383,7 +3223,7 @@ private:
 
     cv::Mat& src_;
     cv::Mat& dst_;
-    int* lut_;
+    uchar* lut_;
 };
 
 CV_IMPL void cvEqualizeHist( const CvArr* srcarr, CvArr* dstarr )
@@ -3464,10 +3304,9 @@ void cv::equalizeHist( InputArray _src, OutputArray _dst )
 
     const int hist_sz = EqualizeHistCalcHist_Invoker::HIST_SZ;
     int hist[hist_sz] = {0,};
-    int lut[hist_sz];
+    int lut[hist_sz] = {0,};
 
     EqualizeHistCalcHist_Invoker calcBody(src, hist, &histogramLockInstance);
-    EqualizeHistLut_Invoker      lutBody(src, dst, lut);
     cv::Range heightRange(0, src.rows);
 
     if(EqualizeHistCalcHist_Invoker::isWorthParallel(src))
@@ -3493,6 +3332,12 @@ void cv::equalizeHist( InputArray _src, OutputArray _dst )
         sum += hist[i];
         lut[i] = saturate_cast<uchar>(sum * scale);
     }
+
+    uchar lut_u8[hist_sz];
+    for (int j = 0; j < hist_sz; ++j)
+        lut_u8[j] = (uchar)lut[j];
+
+    EqualizeHistLut_Invoker lutBody(src, dst, lut_u8);
 
     if(EqualizeHistLut_Invoker::isWorthParallel(src))
         parallel_for_(heightRange, lutBody);

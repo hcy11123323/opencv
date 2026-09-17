@@ -60,7 +60,6 @@ namespace cv {
 static bool ocl_boxFilter3x3_8UC1( InputArray _src, OutputArray _dst, int ddepth,
                                    Size ksize, Point anchor, int borderType, bool normalize )
 {
-    const ocl::Device & dev = ocl::Device::getDefault();
     int type = _src.type(), sdepth = CV_MAT_DEPTH(type), cn = CV_MAT_CN(type);
 
     if (ddepth < 0)
@@ -71,7 +70,7 @@ static bool ocl_boxFilter3x3_8UC1( InputArray _src, OutputArray _dst, int ddepth
     if (anchor.y < 0)
         anchor.y = ksize.height / 2;
 
-    if ( !(dev.isIntel() && (type == CV_8UC1) &&
+    if ( !(type == CV_8UC1 &&
          (_src.offset() == 0) && (_src.step() % 4 == 0) &&
          (_src.cols() % 16 == 0) && (_src.rows() % 2 == 0) &&
          (anchor.x == 1) && (anchor.y == 1) &&
@@ -159,7 +158,7 @@ static bool ocl_boxFilter( InputArray _src, OutputArray _dst, int ddepth,
 
     ocl::Kernel kernel;
 
-    if (dev.isIntel() && !(dev.type() & ocl::Device::TYPE_CPU) &&
+    if (!(dev.type() & ocl::Device::TYPE_CPU) &&
         ((ksize.width < 5 && ksize.height < 5 && esz <= 4) ||
          (ksize.width == 5 && ksize.height == 5 && cn == 1)))
     {
@@ -314,52 +313,6 @@ Ptr<FilterEngine> createBoxFilter(int srcType, int dstType, Size ksize,
         CV_CPU_DISPATCH_MODES_ALL);
 }
 
-#if 0 //defined(HAVE_IPP)
-static bool ipp_boxfilter(Mat &src, Mat &dst, Size ksize, Point anchor, bool normalize, int borderType)
-{
-#ifdef HAVE_IPP_IW
-    CV_INSTRUMENT_REGION_IPP();
-
-#if IPP_VERSION_X100 < 201801
-    // Problem with SSE42 optimization for 16s and some 8u modes
-    if(ipp::getIppTopFeatures() == ippCPUID_SSE42 && (((src.depth() == CV_16S || src.depth() == CV_16U) && (src.channels() == 3 || src.channels() == 4)) || (src.depth() == CV_8U && src.channels() == 3 && (ksize.width > 5 || ksize.height > 5))))
-        return false;
-
-    // Other optimizations has some degradations too
-    if((((src.depth() == CV_16S || src.depth() == CV_16U) && (src.channels() == 4)) || (src.depth() == CV_8U && src.channels() == 1 && (ksize.width > 5 || ksize.height > 5))))
-        return false;
-#endif
-
-    if(!normalize)
-        return false;
-
-    if(!ippiCheckAnchor(anchor, ksize))
-        return false;
-
-    try
-    {
-        ::ipp::IwiImage       iwSrc      = ippiGetImage(src);
-        ::ipp::IwiImage       iwDst      = ippiGetImage(dst);
-        ::ipp::IwiSize        iwKSize    = ippiGetSize(ksize);
-        ::ipp::IwiBorderSize  borderSize(iwKSize);
-        ::ipp::IwiBorderType  ippBorder(ippiGetBorder(iwSrc, borderType, borderSize));
-        if(!ippBorder)
-            return false;
-
-        CV_INSTRUMENT_FUN_IPP(::ipp::iwiFilterBox, iwSrc, iwDst, iwKSize, ::ipp::IwDefault(), ippBorder);
-    }
-    catch (const ::ipp::IwException &)
-    {
-        return false;
-    }
-
-    return true;
-#else
-    CV_UNUSED(src); CV_UNUSED(dst); CV_UNUSED(ksize); CV_UNUSED(anchor); CV_UNUSED(normalize); CV_UNUSED(borderType);
-    return false;
-#endif
-}
-#endif
 
 
 void boxFilter(InputArray _src, OutputArray _dst, int ddepth,
@@ -401,7 +354,6 @@ void boxFilter(InputArray _src, OutputArray _dst, int ddepth,
              ofs.x, ofs.y, wsz.width - src.cols - ofs.x, wsz.height - src.rows - ofs.y, ksize.width, ksize.height,
              anchor.x, anchor.y, normalize, borderType&~BORDER_ISOLATED);
 
-    //CV_IPP_RUN_FAST(ipp_boxfilter(src, dst, ksize, anchor, normalize, borderType));
 
     borderType = (borderType&~BORDER_ISOLATED);
 

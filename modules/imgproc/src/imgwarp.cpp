@@ -13,6 +13,7 @@
 // Copyright (C) 2000-2008, Intel Corporation, all rights reserved.
 // Copyright (C) 2009, Willow Garage Inc., all rights reserved.
 // Copyright (C) 2014-2015, Itseez Inc., all rights reserved.
+// Copyright (C) 2026, Advanced Micro Devices, all rights reserved.
 // Third party copyrights are property of their respective owners.
 //
 // Redistribution and use in source and binary forms, with or without modification,
@@ -54,6 +55,9 @@
 #include "opencv2/core/hal/intrin.hpp"
 #include "opencv2/core/softfloat.hpp"
 #include "imgwarp.hpp"
+
+#include "imgwarp.simd.hpp"
+#include "imgwarp.simd_declarations.hpp" // defines CV_CPU_DISPATCH_MODES_ALL=AVX512_ICL,...,BASELINE based on CMakeLists.txt content
 
 using namespace cv;
 
@@ -173,8 +177,8 @@ static const void* initInterTab2D( int method, bool fixpt )
             for( j = 0; j < INTER_TAB_SIZE; j++, tab += ksize*ksize, itab += ksize*ksize )
             {
                 int isum = 0;
-                NNDeltaTab_i[i*INTER_TAB_SIZE+j][0] = j < INTER_TAB_SIZE/2;
-                NNDeltaTab_i[i*INTER_TAB_SIZE+j][1] = i < INTER_TAB_SIZE/2;
+                NNDeltaTab_i[i*INTER_TAB_SIZE+j][0] = j >= INTER_TAB_SIZE/2;
+                NNDeltaTab_i[i*INTER_TAB_SIZE+j][1] = i >= INTER_TAB_SIZE/2;
 
                 for( k1 = 0; k1 < ksize; k1++ )
                 {
@@ -611,6 +615,81 @@ template<bool isRelative> using RemapVec_8u = RemapNoVec<isRelative>;
 
 #endif
 
+template<typename T, typename AT>
+struct RemapBilinearVecC1
+{
+    int operator()(const T*, size_t, T*, const short*, const ushort*,
+                   const AT*, int, int, int) const { return 0; }
+};
+
+template<>
+struct RemapBilinearVecC1<float, float>
+{
+    int operator()(const float* S0, size_t sstep, float* D, const short* XY,
+                   const ushort* FXY, const float* wtab, int dx, int X1, int off_y) const
+    {
+        CV_CPU_DISPATCH(remapBilinearC1_simd,
+            (CV_32F, (const uchar*)S0, sstep, (uchar*)D, XY, FXY, wtab, dx, X1, off_y),
+            CV_CPU_DISPATCH_MODES_ALL);
+    }
+};
+
+template<>
+struct RemapBilinearVecC1<ushort, float>
+{
+    int operator()(const ushort* S0, size_t sstep, ushort* D, const short* XY,
+                   const ushort* FXY, const float* wtab, int dx, int X1, int off_y) const
+    {
+        CV_CPU_DISPATCH(remapBilinearC1_simd,
+            (CV_16U, (const uchar*)S0, sstep, (uchar*)D, XY, FXY, wtab, dx, X1, off_y),
+            CV_CPU_DISPATCH_MODES_ALL);
+    }
+};
+
+template<>
+struct RemapBilinearVecC1<short, float>
+{
+    int operator()(const short* S0, size_t sstep, short* D, const short* XY,
+                   const ushort* FXY, const float* wtab, int dx, int X1, int off_y) const
+    {
+        CV_CPU_DISPATCH(remapBilinearC1_simd,
+            (CV_16S, (const uchar*)S0, sstep, (uchar*)D, XY, FXY, wtab, dx, X1, off_y),
+            CV_CPU_DISPATCH_MODES_ALL);
+    }
+};
+
+static inline int remapBilinearSameRun( const short* XY, int dx, int end,
+                                         unsigned width1, unsigned height1, bool inl )
+{
+    int n = 0;
+#if (CV_SIMD || CV_SIMD_SCALABLE)
+    const int span = VTraits<v_int16>::vlanes();
+    const v_int16 vw  = vx_setall_s16((short)std::min<unsigned>(width1, 0x7fff));
+    const v_int16 vh  = vx_setall_s16((short)std::min<unsigned>(height1, 0x7fff));
+    const v_int16 vm1 = vx_setall_s16(-1);
+    for( ; dx + n + span <= end; n += span )
+    {
+        v_int16 sx, sy;
+        v_load_deinterleave(XY + (dx + n) * 2, sx, sy);
+        // in-bounds: 0 <= sx < width1 && 0 <= sy < height1
+        v_int16 inb = v_and(v_and(v_gt(sx, vm1), v_lt(sx, vw)),
+                            v_and(v_gt(sy, vm1), v_lt(sy, vh)));
+        const bool allSame = inl ? v_check_all(inb) : !v_check_any(inb);
+        if( !allSame )
+            break;
+    }
+    vx_cleanup();
+#endif
+    for( ; dx + n < end; n++ )
+    {
+        const int sx = XY[(dx + n) * 2], sy = XY[(dx + n) * 2 + 1];
+        const bool ib = (unsigned)sx < width1 && (unsigned)sy < height1;
+        if( ib != inl )
+            break;
+    }
+    return n;
+}
+
 template<class CastOp, class VecOp, typename AT, bool isRelative>
 static void remapBilinear( const Mat& _src, Mat& _dst, const Mat& _xy,
                            const Mat& _fxy, const void* _wtab,
@@ -647,6 +726,12 @@ static void remapBilinear( const Mat& _src, Mat& _dst, const Mat& _xy,
         const int off_y = (isRelative ? (_offset.y+dy) : 0);
         for(int dx = 0; dx <= dsize.width; dx++ )
         {
+            if( !isRelative && dx < dsize.width )
+            {
+                int n = remapBilinearSameRun(XY, dx, dsize.width, width1, height1, prevInlier);
+                if( n > 0 )
+                    dx += n - 1;
+            }
             bool curInlier = dx < dsize.width ?
                 (unsigned)XY[dx*2]+(isRelative ? (_offset.x+dx) : 0) < width1 &&
                 (unsigned)XY[dx*2+1]+off_y < height1 : !prevInlier;
@@ -667,6 +752,11 @@ static void remapBilinear( const Mat& _src, Mat& _dst, const Mat& _xy,
 
                 if( cn == 1 )
                 {
+                    if( !isRelative )
+                    {
+                        int n = RemapBilinearVecC1<T, AT>()(S0, sstep, D, XY, FXY, wtab, dx, X1, off_y);
+                        D += n; dx += n;
+                    }
                     for( ; dx < X1; dx++, D++ )
                     {
                         int sx = XY[dx*2]+(isRelative ? (_offset.x+dx) : 0), sy = XY[dx*2+1]+off_y;
@@ -843,6 +933,53 @@ static void remapBilinear( const Mat& _src, Mat& _dst, const Mat& _xy,
 }
 
 
+// Dispatch shim for the single-channel non-relative bicubic in-bounds fast path (32F only).
+template<typename T, typename AT>
+struct RemapBicubicVecC1
+{
+    int operator()(const T*, size_t, T*, const short*, const ushort*, const AT*,
+                   int, int, unsigned, unsigned, int) const { return 0; }
+};
+
+template<>
+struct RemapBicubicVecC1<float, float>
+{
+    int operator()(const float* S0, size_t sstep, float* D, const short* XY,
+                   const ushort* FXY, const float* wtab, int dx, int dwidth, unsigned width1,
+                   unsigned height1, int off_y) const
+    {
+        CV_CPU_DISPATCH(remapBicubicC1wp_simd,
+            (CV_32F, (const uchar*)S0, sstep, (uchar*)D, XY, FXY, wtab, dx, dwidth, width1, height1, off_y),
+            CV_CPU_DISPATCH_MODES_ALL);
+    }
+};
+
+template<>
+struct RemapBicubicVecC1<ushort, float>
+{
+    int operator()(const ushort* S0, size_t sstep, ushort* D, const short* XY,
+                   const ushort* FXY, const float* wtab, int dx, int dwidth, unsigned width1,
+                   unsigned height1, int off_y) const
+    {
+        CV_CPU_DISPATCH(remapBicubicC1wp_simd,
+            (CV_16U, (const uchar*)S0, sstep, (uchar*)D, XY, FXY, wtab, dx, dwidth, width1, height1, off_y),
+            CV_CPU_DISPATCH_MODES_ALL);
+    }
+};
+
+template<>
+struct RemapBicubicVecC1<short, float>
+{
+    int operator()(const short* S0, size_t sstep, short* D, const short* XY,
+                   const ushort* FXY, const float* wtab, int dx, int dwidth, unsigned width1,
+                   unsigned height1, int off_y) const
+    {
+        CV_CPU_DISPATCH(remapBicubicC1wp_simd,
+            (CV_16S, (const uchar*)S0, sstep, (uchar*)D, XY, FXY, wtab, dx, dwidth, width1, height1, off_y),
+            CV_CPU_DISPATCH_MODES_ALL);
+    }
+};
+
 template<class CastOp, typename AT, int ONE, bool isRelative>
 static void remapBicubic( const Mat& _src, Mat& _dst, const Mat& _xy,
                           const Mat& _fxy, const void* _wtab,
@@ -879,6 +1016,12 @@ static void remapBicubic( const Mat& _src, Mat& _dst, const Mat& _xy,
         const int off_y = isRelative ? (_offset.y+dy) : 0;
         for(int dx = 0; dx < dsize.width; dx++, D += cn )
         {
+            if( cn == 1 && !isRelative )
+            {
+                int n = RemapBicubicVecC1<T, AT>()(S0, sstep, D, XY, FXY, wtab, dx,
+                                                   dsize.width, width1, height1, off_y);
+                if( n > 0 ) { D += (n - 1)*cn; dx += n - 1; continue; }
+            }
             const int off_x = isRelative ? (_offset.x+dx) : 0;
             int sx = XY[dx*2]-1+off_x, sy = XY[dx*2+1]-1+off_y;
             const AT* w = wtab + FXY[dx]*16;
@@ -948,6 +1091,33 @@ static void remapBicubic( const Mat& _src, Mat& _dst, const Mat& _xy,
 }
 
 
+template<typename T, typename AT>
+struct RemapLanczos4VecC1
+{
+    int operator()(const T*, size_t, T*, const short*, const ushort*, const AT*,
+                   int, int, unsigned, unsigned, int) const { return 0; }
+};
+
+#define CV_REMAP_LANCZOS4_SHIM(T, DEPTH)                                             \
+template<> struct RemapLanczos4VecC1<T, float>                                       \
+{                                                                                   \
+    int operator()(const T* S0, size_t sstep, T* D, const short* XY,                \
+                   const ushort* FXY, const float* wtab, int dx, int dwidth,        \
+                   unsigned width1, unsigned height1, int off_y) const              \
+    {                                                                               \
+        CV_CPU_DISPATCH(remapLanczos4C1_simd,                                       \
+            (DEPTH, (const uchar*)S0, sstep, (uchar*)D, XY, FXY, wtab,              \
+             dx, dwidth, width1, height1, off_y),                                   \
+            CV_CPU_DISPATCH_MODES_ALL);                                             \
+    }                                                                               \
+};
+// 32F is intentionally not shimmed: its vectorized accumulation deviates beyond
+// the float accuracy tolerance, so it stays on the scalar loop. Emitting a shim
+// would add a per-pixel dispatch call that returns 0 and slows the scalar path.
+CV_REMAP_LANCZOS4_SHIM(ushort, CV_16U)
+CV_REMAP_LANCZOS4_SHIM(short, CV_16S)
+#undef CV_REMAP_LANCZOS4_SHIM
+
 template<class CastOp, typename AT, int ONE, bool isRelative>
 static void remapLanczos4( const Mat& _src, Mat& _dst, const Mat& _xy,
                            const Mat& _fxy, const void* _wtab,
@@ -984,6 +1154,12 @@ static void remapLanczos4( const Mat& _src, Mat& _dst, const Mat& _xy,
         const int off_y = isRelative ? (_offset.y+dy) : 0;
         for(int dx = 0; dx < dsize.width; dx++, D += cn )
         {
+            if( cn == 1 && !isRelative )
+            {
+                int n = RemapLanczos4VecC1<T, AT>()(S0, sstep, D, XY, FXY, wtab, dx,
+                                                    dsize.width, width1, height1, off_y);
+                if( n > 0 ) { D += (n - 1)*cn; dx += n - 1; continue; }
+            }
             const int off_x = isRelative ? (_offset.x+dx) : 0;
             int sx = XY[dx*2]-3+off_x, sy = XY[dx*2+1]-3+off_y;
             const AT* w = wtab + FXY[dx]*64;
@@ -1131,21 +1307,21 @@ public:
                             const float* sY = m2->ptr<float>(y+y1) + x;
                             x1 = 0;
 
-                            #if CV_SIMD128
+                            #if (CV_SIMD || CV_SIMD_SCALABLE)
                             {
-                                int span = VTraits<v_float32x4>::vlanes();
+                                int span = VTraits<v_float32>::vlanes();
                                 for( ; x1 <= bcols - span * 2; x1 += span * 2 )
                                 {
-                                    v_int32x4 ix0 = v_round(v_load(sX + x1));
-                                    v_int32x4 iy0 = v_round(v_load(sY + x1));
-                                    v_int32x4 ix1 = v_round(v_load(sX + x1 + span));
-                                    v_int32x4 iy1 = v_round(v_load(sY + x1 + span));
+                                    v_int32 ix0 = v_round(vx_load(sX + x1));
+                                    v_int32 iy0 = v_round(vx_load(sY + x1));
+                                    v_int32 ix1 = v_round(vx_load(sX + x1 + span));
+                                    v_int32 iy1 = v_round(vx_load(sY + x1 + span));
 
-                                    v_int16x8 dx, dy;
-                                    dx = v_pack(ix0, ix1);
-                                    dy = v_pack(iy0, iy1);
+                                    v_int16 dx = v_pack(ix0, ix1);
+                                    v_int16 dy = v_pack(iy0, iy1);
                                     v_store_interleave(XY + x1 * 2, dx, dy);
                                 }
+                                vx_cleanup();
                             }
                             #endif
                             for( ; x1 < bcols; x1++ )
@@ -1172,12 +1348,13 @@ public:
                         const ushort* sA = m2->ptr<ushort>(y+y1) + x;
                         x1 = 0;
 
-                        #if CV_SIMD128
+                        #if (CV_SIMD || CV_SIMD_SCALABLE)
                         {
-                            v_uint16x8 v_scale = v_setall_u16(INTER_TAB_SIZE2 - 1);
-                            int span = VTraits<v_uint16x8>::vlanes();
+                            v_uint16 v_scale = vx_setall_u16(INTER_TAB_SIZE2 - 1);
+                            int span = VTraits<v_uint16>::vlanes();
                             for( ; x1 <= bcols - span; x1 += span )
-                                v_store((unsigned short*)(A + x1), v_and(v_load(sA + x1), v_scale));
+                                v_store((unsigned short*)(A + x1), v_and(vx_load(sA + x1), v_scale));
+                            vx_cleanup();
                         }
                         #endif
                         for( ; x1 < bcols; x1++ )
@@ -1189,26 +1366,27 @@ public:
                         const float* sY = m2->ptr<float>(y+y1) + x;
 
                         x1 = 0;
-                        #if CV_SIMD128
+                        #if (CV_SIMD || CV_SIMD_SCALABLE)
                         {
-                            v_float32x4 v_scale = v_setall_f32((float)INTER_TAB_SIZE);
-                            v_int32x4 v_scale2 = v_setall_s32(INTER_TAB_SIZE - 1);
-                            int span = VTraits<v_float32x4>::vlanes();
+                            v_float32 v_scale = vx_setall_f32((float)INTER_TAB_SIZE);
+                            v_int32 v_scale2 = vx_setall_s32(INTER_TAB_SIZE - 1);
+                            int span = VTraits<v_float32>::vlanes();
                             for( ; x1 <= bcols - span * 2; x1 += span * 2 )
                             {
-                                v_int32x4 v_sx0 = v_round(v_mul(v_scale, v_load(sX + x1)));
-                                v_int32x4 v_sy0 = v_round(v_mul(v_scale, v_load(sY + x1)));
-                                v_int32x4 v_sx1 = v_round(v_mul(v_scale, v_load(sX + x1 + span)));
-                                v_int32x4 v_sy1 = v_round(v_mul(v_scale, v_load(sY + x1 + span)));
-                                v_uint16x8 v_sx8 = v_reinterpret_as_u16(v_pack(v_and(v_sx0, v_scale2), v_and(v_sx1, v_scale2)));
-                                v_uint16x8 v_sy8 = v_reinterpret_as_u16(v_pack(v_and(v_sy0, v_scale2), v_and(v_sy1, v_scale2)));
-                                v_uint16x8 v_v = v_or(v_shl<INTER_BITS>(v_sy8), v_sx8);
+                                v_int32 v_sx0 = v_round(v_mul(v_scale, vx_load(sX + x1)));
+                                v_int32 v_sy0 = v_round(v_mul(v_scale, vx_load(sY + x1)));
+                                v_int32 v_sx1 = v_round(v_mul(v_scale, vx_load(sX + x1 + span)));
+                                v_int32 v_sy1 = v_round(v_mul(v_scale, vx_load(sY + x1 + span)));
+                                v_uint16 v_sx8 = v_reinterpret_as_u16(v_pack(v_and(v_sx0, v_scale2), v_and(v_sx1, v_scale2)));
+                                v_uint16 v_sy8 = v_reinterpret_as_u16(v_pack(v_and(v_sy0, v_scale2), v_and(v_sy1, v_scale2)));
+                                v_uint16 v_v = v_or(v_shl<INTER_BITS>(v_sy8), v_sx8);
                                 v_store(A + x1, v_v);
 
-                                v_int16x8 v_d0 = v_pack(v_shr<INTER_BITS>(v_sx0), v_shr<INTER_BITS>(v_sx1));
-                                v_int16x8 v_d1 = v_pack(v_shr<INTER_BITS>(v_sy0), v_shr<INTER_BITS>(v_sy1));
+                                v_int16 v_d0 = v_pack(v_shr<INTER_BITS>(v_sx0), v_shr<INTER_BITS>(v_sx1));
+                                v_int16 v_d1 = v_pack(v_shr<INTER_BITS>(v_sy0), v_shr<INTER_BITS>(v_sy1));
                                 v_store_interleave(XY + (x1 << 1), v_d0, v_d1);
                             }
+                            vx_cleanup();
                         }
                         #endif
                         for( ; x1 < bcols; x1++ )
@@ -1226,28 +1404,29 @@ public:
                         const float* sXY = m1->ptr<float>(y+y1) + x*2;
                         x1 = 0;
 
-                        #if CV_SIMD128
+                        #if (CV_SIMD || CV_SIMD_SCALABLE)
                         {
-                            v_float32x4 v_scale = v_setall_f32((float)INTER_TAB_SIZE);
-                            v_int32x4 v_scale2 = v_setall_s32(INTER_TAB_SIZE - 1), v_scale3 = v_setall_s32(INTER_TAB_SIZE);
-                            int span = VTraits<v_float32x4>::vlanes();
+                            v_float32 v_scale = vx_setall_f32((float)INTER_TAB_SIZE);
+                            v_int32 v_scale2 = vx_setall_s32(INTER_TAB_SIZE - 1), v_scale3 = vx_setall_s32(INTER_TAB_SIZE);
+                            int span = VTraits<v_float32>::vlanes();
                             for( ; x1 <= bcols - span * 2; x1 += span * 2 )
                             {
-                                v_float32x4 v_fx, v_fy;
+                                v_float32 v_fx, v_fy;
                                 v_load_deinterleave(sXY + (x1 << 1), v_fx, v_fy);
-                                v_int32x4 v_sx0 = v_round(v_mul(v_fx, v_scale));
-                                v_int32x4 v_sy0 = v_round(v_mul(v_fy, v_scale));
+                                v_int32 v_sx0 = v_round(v_mul(v_fx, v_scale));
+                                v_int32 v_sy0 = v_round(v_mul(v_fy, v_scale));
                                 v_load_deinterleave(sXY + ((x1 + span) << 1), v_fx, v_fy);
-                                v_int32x4 v_sx1 = v_round(v_mul(v_fx, v_scale));
-                                v_int32x4 v_sy1 = v_round(v_mul(v_fy, v_scale));
-                                v_int32x4 v_v0 = v_muladd(v_scale3, (v_and(v_sy0, v_scale2)), (v_and(v_sx0, v_scale2)));
-                                v_int32x4 v_v1 = v_muladd(v_scale3, (v_and(v_sy1, v_scale2)), (v_and(v_sx1, v_scale2)));
-                                v_uint16x8 v_v8 = v_reinterpret_as_u16(v_pack(v_v0, v_v1));
+                                v_int32 v_sx1 = v_round(v_mul(v_fx, v_scale));
+                                v_int32 v_sy1 = v_round(v_mul(v_fy, v_scale));
+                                v_int32 v_v0 = v_muladd(v_scale3, (v_and(v_sy0, v_scale2)), (v_and(v_sx0, v_scale2)));
+                                v_int32 v_v1 = v_muladd(v_scale3, (v_and(v_sy1, v_scale2)), (v_and(v_sx1, v_scale2)));
+                                v_uint16 v_v8 = v_reinterpret_as_u16(v_pack(v_v0, v_v1));
                                 v_store(A + x1, v_v8);
-                                v_int16x8 v_dx = v_pack(v_shr<INTER_BITS>(v_sx0), v_shr<INTER_BITS>(v_sx1));
-                                v_int16x8 v_dy = v_pack(v_shr<INTER_BITS>(v_sy0), v_shr<INTER_BITS>(v_sy1));
+                                v_int16 v_dx = v_pack(v_shr<INTER_BITS>(v_sx0), v_shr<INTER_BITS>(v_sx1));
+                                v_int16 v_dy = v_pack(v_shr<INTER_BITS>(v_sy0), v_shr<INTER_BITS>(v_sy1));
                                 v_store_interleave(XY + (x1 << 1), v_dx, v_dy);
                             }
+                            vx_cleanup();
                         }
                         #endif
 
@@ -1989,15 +2168,57 @@ void cv::convertMaps( InputArray _map1, InputArray _map2,
 namespace cv
 {
 
+static Rect warpSourceFootprintRoi(Size srcSize, Size dstSize, const double* M, bool isPerspective)
+{
+    const Rect fullRoi(0, 0, dstSize.width, dstSize.height);
+
+    // Invert M because it maps destination to source while we need the reverse
+    const Matx33d fullM = isPerspective
+        ? Matx33d(M[0], M[1], M[2], M[3], M[4], M[5], M[6], M[7], M[8])
+        : Matx33d(M[0], M[1], M[2], M[3], M[4], M[5], 0.0, 0.0, 1.0);
+    bool invertible = false;
+    const Matx33d invM = fullM.inv(DECOMP_LU, &invertible);
+    if (!invertible)
+        return fullRoi;
+
+    const int INTERPOLATION_PADDING = 4;    // assume worst case: INTER_LANCZOS4
+    const double x0 = -INTERPOLATION_PADDING, x1 = srcSize.width + INTERPOLATION_PADDING;
+    const double y0 = -INTERPOLATION_PADDING, y1 = srcSize.height + INTERPOLATION_PADDING;
+    const Point2d corners[4] = { {x0, y0}, {x1, y0}, {x1, y1}, {x0, y1} };
+    double minX = DBL_MAX, maxX = -DBL_MAX, minY = DBL_MAX, maxY = -DBL_MAX;
+    int zsign = 0;
+    for (const Point2d& c : corners)
+    {
+        const double z = invM(2, 0) * c.x + invM(2, 1) * c.y + invM(2, 2);
+        if (std::abs(z) < 1e-9)
+            return fullRoi;         // z small => xy range close to inf
+        const int s = z > 0 ? 1 : -1;
+        if (zsign == 0)
+            zsign = s;
+        else if (s != zsign)
+            return fullRoi;         // sign changed => corners front and rear
+        const double x = (invM(0, 0) * c.x + invM(0, 1) * c.y + invM(0, 2)) / z;
+        const double y = (invM(1, 0) * c.x + invM(1, 1) * c.y + invM(1, 2)) / z;
+        minX = std::min(minX, x); maxX = std::max(maxX, x);
+        minY = std::min(minY, y); maxY = std::max(maxY, y);
+    }
+    const int x0i = cvFloor(std::min(std::max(minX, -1.0), dstSize.width + 1.0));
+    const int x1i = cvCeil (std::min(std::max(maxX, -1.0), dstSize.width + 1.0));
+    const int y0i = cvFloor(std::min(std::max(minY, -1.0), dstSize.height + 1.0));
+    const int y1i = cvCeil (std::min(std::max(maxY, -1.0), dstSize.height + 1.0));
+    return Rect(x0i, y0i, x1i - x0i, y1i - y0i) & fullRoi;
+}
+
 class WarpAffineInvoker :
     public ParallelLoopBody
 {
 public:
     WarpAffineInvoker(const Mat &_src, Mat &_dst, int _interpolation, int _borderType,
-                      const Scalar &_borderValue, int *_adelta, int *_bdelta, const double *_M) :
+                      const Scalar &_borderValue, int *_adelta, int *_bdelta, const double *_M,
+                      const Range &_colRange) :
         ParallelLoopBody(), src(_src), dst(_dst), interpolation(_interpolation),
         borderType(_borderType), borderValue(_borderValue), adelta(_adelta), bdelta(_bdelta),
-        M(_M)
+        M(_M), colRange(_colRange)
     {
     }
 
@@ -2016,9 +2237,9 @@ public:
 
         for( y = range.start; y < range.end; y += bh0 )
         {
-            for( x = 0; x < dst.cols; x += bw0 )
+            for( x = colRange.start; x < colRange.end; x += bw0 )
             {
-                int bw = std::min( bw0, dst.cols - x);
+                int bw = std::min( bw0, colRange.end - x);
                 int bh = std::min( bh0, range.end - y);
 
                 Mat _XY(bh, bw, CV_16SC2, XY);
@@ -2054,6 +2275,7 @@ private:
     Scalar borderValue;
     int *adelta, *bdelta;
     const double *M;
+    Range colRange;
 };
 
 #ifdef HAVE_OPENCL
@@ -2269,11 +2491,20 @@ void warpAffine(int src_type,
         bdelta[x] = saturate_cast<int>(M[3]*x*AB_SCALE);
     }
 
-    Range range(0, dst.rows);
+    Range rowRange(0, dst.rows);
+    Range colRange(0, dst.cols);
+    double nbPixels = (double)dst.total();
+    if ((borderType & ~BORDER_ISOLATED) == BORDER_TRANSPARENT)
+    {
+        const Rect dstRoi = warpSourceFootprintRoi(src.size(), dst.size(), M, false);
+        rowRange = Range(dstRoi.y, dstRoi.y + dstRoi.height);
+        colRange = Range(dstRoi.x, dstRoi.x + dstRoi.width);
+        nbPixels = dstRoi.area();
+    }
     WarpAffineInvoker invoker(src, dst, interpolation, borderType,
                               Scalar(borderValue[0], borderValue[1], borderValue[2], borderValue[3]),
-                              adelta, bdelta, M);
-    parallel_for_(range, invoker, dst.total()/(double)(1<<16));
+                              adelta, bdelta, M, colRange);
+    parallel_for_(rowRange, invoker, nbPixels/(1<<16));
 }
 
 CV_DISABLE_UBSAN
@@ -2675,9 +2906,9 @@ class WarpPerspectiveInvoker :
 {
 public:
     WarpPerspectiveInvoker(const Mat &_src, Mat &_dst, const double *_M, int _interpolation,
-                           int _borderType, const Scalar &_borderValue) :
+                           int _borderType, const Scalar &_borderValue, const Range &_colRange) :
         ParallelLoopBody(), src(_src), dst(_dst), M(_M), interpolation(_interpolation),
-        borderType(_borderType), borderValue(_borderValue)
+        borderType(_borderType), borderValue(_borderValue), colRange(_colRange)
     {
 #if defined(_MSC_VER) && _MSC_VER == 1800 /* MSVS 2013 */ && CV_AVX
         // details: https://github.com/opencv/opencv/issues/11026
@@ -2698,9 +2929,9 @@ public:
 
         for( y = range.start; y < range.end; y += bh0 )
         {
-            for( x = 0; x < width; x += bw0 )
+            for( x = colRange.start; x < colRange.end; x += bw0 )
             {
-                int bw = std::min( bw0, width - x);
+                int bw = std::min( bw0, colRange.end - x);
                 int bh = std::min( bh0, range.end - y); // height
 
                 Mat _XY(bh, bw, CV_16SC2, XY);
@@ -2736,6 +2967,7 @@ private:
     const double* M;
     int interpolation, borderType;
     Scalar borderValue;
+    Range colRange;
 };
 
 
@@ -2750,9 +2982,18 @@ void warpPerspective(int src_type,
     Mat src(Size(src_width, src_height), src_type, const_cast<uchar*>(src_data), src_step);
     Mat dst(Size(dst_width, dst_height), src_type, dst_data, dst_step);
 
-    Range range(0, dst.rows);
-    WarpPerspectiveInvoker invoker(src, dst, M, interpolation, borderType, Scalar(borderValue[0], borderValue[1], borderValue[2], borderValue[3]));
-    parallel_for_(range, invoker, dst.total()/(double)(1<<16));
+    Range rowRange(0, dst.rows);
+    Range colRange(0, dst.cols);
+    double nbPixels = (double)dst.total();
+    if ((borderType & ~BORDER_ISOLATED) == BORDER_TRANSPARENT)
+    {
+        const Rect dstRoi = warpSourceFootprintRoi(src.size(), dst.size(), M, true);
+        rowRange = Range(dstRoi.y, dstRoi.y + dstRoi.height);
+        colRange = Range(dstRoi.x, dstRoi.x + dstRoi.width);
+        nbPixels = dstRoi.area();
+    }
+    WarpPerspectiveInvoker invoker(src, dst, M, interpolation, borderType, Scalar(borderValue[0], borderValue[1], borderValue[2], borderValue[3]), colRange);
+    parallel_for_(rowRange, invoker, nbPixels/(1<<16));
 }
 
 void warpPerspectiveBlocklineNN(const double *M, short* xy, double X0, double Y0, double W0, int bw)
