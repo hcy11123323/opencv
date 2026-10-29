@@ -3004,6 +3004,68 @@ TEST(Core_AbsDiff, regression_29639_integer_overflow)
     }
 }
 
+typedef testing::TestWithParam<tuple<Size, int, bool, int> > MeanStdDev8uBlockedTest;
+
+TEST_P(MeanStdDev8uBlockedTest, accuracy)
+{
+    const Size size = get<0>(GetParam());
+    const int pattern = get<1>(GetParam());
+    const bool padded = get<2>(GetParam());
+    const int output = get<3>(GetParam());
+    const int border = padded ? 1 : 0;
+    Mat storage(size.height + 2 * border, size.width + 3 * border, CV_8U, Scalar::all(0xa5));
+    Mat src = storage(Rect(border, border, size.width, size.height));
+    if (pattern < 2 || pattern == 4)
+    {
+        src.setTo(pattern == 0 ? 0 : 255);
+        if (pattern == 4)
+            src.at<uchar>(0, 0) = 0;
+    }
+    else if (pattern == 2)
+    {
+        for (int y = 0; y < src.rows; ++y)
+            for (int x = 0; x < src.cols; ++x)
+                src.at<uchar>(y, x) = static_cast<uchar>(x + 3 * y);
+    }
+    else
+        theRNG().fill(src, RNG::UNIFORM, 0, 256);
+    const Mat original = storage.clone();
+
+    uint64_t sum = 0, sqsum = 0;
+    for (int y = 0; y < src.rows; ++y)
+        for (int x = 0; x < src.cols; ++x)
+        {
+            const unsigned value = src.at<uchar>(y, x);
+            sum += value;
+            sqsum += value * value;
+        }
+    const double n = static_cast<double>(src.total());
+    const double expectedMean = static_cast<double>(sum) / n;
+    const double expectedDev = std::sqrt(std::max(static_cast<double>(sqsum) / n - expectedMean * expectedMean, 0.0));
+    Scalar mean, dev;
+    if (output == 0)
+        cv::meanStdDev(src, mean, dev);
+    else if (output == 1)
+        cv::meanStdDev(src, noArray(), dev);
+    else
+        cv::meanStdDev(src, mean, noArray());
+    if (output != 1)
+    {
+        EXPECT_NEAR(expectedMean, mean[0], 1e-12);
+    }
+    if (output != 2)
+    {
+        EXPECT_NEAR(expectedDev, dev[0], 1e-5);
+    }
+    EXPECT_EQ(0, cvtest::norm(original, storage, NORM_INF));
+}
+
+INSTANTIATE_TEST_CASE_P(Core_MeanStdDev, MeanStdDev8uBlockedTest, testing::Combine(
+    testing::Values(Size(1, 1), Size(17, 19), Size(64, 64), Size(65535, 1),
+                    Size(65536, 1), Size(65537, 1), Size(131073, 1), Size(257, 257),
+                    Size(17, 4097), Size(1025, 65), Size(1920, 1080)),
+    testing::Values(0, 1, 2, 3, 4), testing::Bool(), testing::Values(0, 1, 2)));
+
 TEST(Core_MeanStdDev, regression_multichannel)
 {
     {

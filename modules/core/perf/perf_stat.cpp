@@ -58,7 +58,7 @@ PERF_TEST_P(Size_MatType, mean_mask, testing::Combine( testing::Values( TYPICAL_
     SANITY_CHECK(s, 5e-5);
 }
 
-PERF_TEST_P(Size_MatType, meanStdDev, testing::Combine( testing::Values( TYPICAL_MAT_SIZES ),
+PERF_TEST_P(Size_MatType, meanStdDev, testing::Combine( testing::Values( TYPICAL_MAT_SIZES, sz2160p ),
                 testing::Values( TYPICAL_MAT_TYPES_STAT_MASK ) ))
 {
     Size sz = get<0>(GetParam());

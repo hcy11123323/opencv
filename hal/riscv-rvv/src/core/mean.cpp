@@ -42,6 +42,65 @@ int meanStdDev(const uchar* src_data, size_t src_step, int width, int height, in
 
 inline int meanStdDev_8UC1(const uchar* src_data, size_t src_step, int width, int height,
                              double* mean_val, double* stddev_val, uchar* mask, size_t mask_step) {
+    if (!mask && width > 0 && src_step == static_cast<size_t>(width) &&
+        height <= std::numeric_limits<int>::max() / width)
+    {
+        width *= height;
+        height = 1;
+    }
+    // Keep the existing path when a row cannot fill even one e8,m1 vector.
+    if (!mask && static_cast<size_t>(width) >= __riscv_vsetvlmax_e8m1())
+    {
+        // Each block has at most 65536 * 255^2 = 4261478400 in its
+        // squared sum, so both the lanes and their reduction fit in uint32.
+        const int block_size = 1 << 16;
+        const size_t vlmax = __riscv_vsetvlmax_e32m8();
+        auto sum = __riscv_vmv_v_x_u32m8(0, vlmax);
+        auto sqsum = __riscv_vmv_v_x_u32m8(0, vlmax);
+        const auto zero = __riscv_vmv_s_x_u32m1(0, 1);
+        uint64_t total_sum = 0, total_sqsum = 0;
+        int remaining = block_size;
+        for (int y = 0; y < height; ++y)
+        {
+            const uchar* row = src_data + static_cast<size_t>(y) * src_step;
+            int x = 0;
+            while (x < width)
+            {
+                const int count = std::min(width - x, remaining);
+                const int end = x + count;
+                for (; x < end; )
+                {
+                    const size_t vl = __riscv_vsetvl_e8m2(end - x);
+                    auto pixel = __riscv_vzext_vf2(__riscv_vle8_v_u8m2(row + x, vl), vl);
+                    sum = __riscv_vwaddu_wv_u32m8_tu(sum, sum, pixel, vl);
+                    sqsum = __riscv_vwmaccu_vv_u32m8_tu(sqsum, pixel, pixel, vl);
+                    x += static_cast<int>(vl);
+                }
+                remaining -= count;
+                if (remaining == 0)
+                {
+                    total_sum += __riscv_vmv_x_s_u32m1_u32(__riscv_vredsum_vs_u32m8_u32m1(sum, zero, vlmax));
+                    total_sqsum += __riscv_vmv_x_s_u32m1_u32(__riscv_vredsum_vs_u32m8_u32m1(sqsum, zero, vlmax));
+                    sum = __riscv_vmv_v_x_u32m8(0, vlmax);
+                    sqsum = __riscv_vmv_v_x_u32m8(0, vlmax);
+                    remaining = block_size;
+                }
+            }
+        }
+        if (remaining != block_size)
+        {
+            total_sum += __riscv_vmv_x_s_u32m1_u32(__riscv_vredsum_vs_u32m8_u32m1(sum, zero, vlmax));
+            total_sqsum += __riscv_vmv_x_s_u32m1_u32(__riscv_vredsum_vs_u32m8_u32m1(sqsum, zero, vlmax));
+        }
+        const double n = static_cast<double>(width) * height;
+        const double mean = n > 0 ? static_cast<double>(total_sum) / n : 0.0;
+        if (mean_val)
+            *mean_val = mean;
+        if (stddev_val)
+            *stddev_val = n > 0 ? std::sqrt(std::max(static_cast<double>(total_sqsum) / n - mean * mean, 0.0)) : 0.0;
+        return CV_HAL_ERROR_OK;
+    }
+
     int nz = 0;
     int vlmax = __riscv_vsetvlmax_e64m8();
     vuint64m8_t vec_sum = __riscv_vmv_v_x_u64m8(0, vlmax);
