@@ -163,25 +163,26 @@ CV_HAL_RVV_ROTATE_C3(rotate90_64uC3, uint64_t, u64, 64)
 
 #undef CV_HAL_RVV_ROTATE_C3
 
-static void rotate90_8uC3_tiled(const uchar* src, size_t src_step, int width, int height,
+using RotateC3Fn = void (*)(const uchar*, size_t, int, int, uchar*, size_t, int);
+
+template<size_t PixelBytes, int TileWidth, int TileHeight, int MinArea, RotateC3Fn Rotate>
+static void rotate90_C3_tiled(const uchar* src, size_t src_step, int width, int height,
                                 uchar* dst, size_t dst_step, int angle)
 {
     if (width < 256 || height < 256 ||
-        static_cast<int64_t>(width) * height < 640 * 480)
+        static_cast<int64_t>(width) * height < MinArea)
     {
-        rotate90_8uC3(src, src_step, width, height, dst, dst_step, angle);
+        Rotate(src, src_step, width, height, dst, dst_step, angle);
         return;
     }
 
-    constexpr int tile_width = 96;
-    constexpr int tile_height = 96;
-    constexpr size_t padding = 3;
+    constexpr size_t padding = PixelBytes;
     constexpr size_t alignment = 64;
-    constexpr size_t bytes = tile_width * (3 * tile_height + padding);
+    constexpr size_t bytes = TileWidth * (PixelBytes * TileHeight + padding);
     std::unique_ptr<uchar[]> buffer(new (std::nothrow) uchar[bytes + alignment - 1]);
     if (!buffer)
     {
-        rotate90_8uC3(src, src_step, width, height, dst, dst_step, angle);
+        Rotate(src, src_step, width, height, dst, dst_step, angle);
         return;
     }
 
@@ -190,16 +191,16 @@ static void rotate90_8uC3_tiled(const uchar* src, size_t src_step, int width, in
     const bool clockwise = angle == 90;
     for (int y = 0; y < height;)
     {
-        const int block_height = std::min(tile_height, height - y);
-        const size_t row_bytes = 3 * static_cast<size_t>(block_height);
+        const int block_height = std::min(TileHeight, height - y);
+        const size_t row_bytes = PixelBytes * static_cast<size_t>(block_height);
         const size_t tile_step = row_bytes + padding;
         for (int x = 0; x < width;)
         {
-            const int block_width = std::min(tile_width, width - x);
+            const int block_width = std::min(TileWidth, width - x);
             const int dst_row = clockwise ? x : width - x - block_width;
             const int dst_col = clockwise ? height - y - block_height : y;
-            uchar* out = dst + dst_row * dst_step + 3 * static_cast<size_t>(dst_col);
-            rotate90_8uC3(src + y * src_step + 3 * static_cast<size_t>(x), src_step,
+            uchar* out = dst + dst_row * dst_step + PixelBytes * static_cast<size_t>(dst_col);
+            Rotate(src + y * src_step + PixelBytes * static_cast<size_t>(x), src_step,
                           block_width, block_height, tile, tile_step, angle);
             for (int row = 0; row < block_width; ++row)
                 std::memcpy(out + row * dst_step, tile + row * tile_step, row_bytes);
@@ -229,8 +230,8 @@ int rotate90(int src_type, const uchar* src_data, size_t src_step, int src_width
             return CV_HAL_ERROR_NOT_IMPLEMENTED;
         switch (channel_size)
         {
-        case 1: rotate90_8uC3_tiled(src_data, src_step, src_width, src_height, dst_data, dst_step, angle); break;
-        case 2: rotate90_16uC3(src_data, src_step, src_width, src_height, dst_data, dst_step, angle); break;
+        case 1: rotate90_C3_tiled<3, 96, 96, 640 * 480, rotate90_8uC3>(src_data, src_step, src_width, src_height, dst_data, dst_step, angle); break;
+        case 2: rotate90_C3_tiled<6, 96, 48, 640 * 512, rotate90_16uC3>(src_data, src_step, src_width, src_height, dst_data, dst_step, angle); break;
         case 4: rotate90_32uC3(src_data, src_step, src_width, src_height, dst_data, dst_step, angle); break;
         case 8: rotate90_64uC3(src_data, src_step, src_width, src_height, dst_data, dst_step, angle); break;
         default: return CV_HAL_ERROR_NOT_IMPLEMENTED;
