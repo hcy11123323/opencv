@@ -232,8 +232,8 @@ int rotate90(int src_type, const uchar* src_data, size_t src_step, int src_width
         {
         case 1: rotate90_C3_tiled<3, 96, 96, 640 * 480, rotate90_8uC3>(src_data, src_step, src_width, src_height, dst_data, dst_step, angle); break;
         case 2: rotate90_C3_tiled<6, 96, 48, 640 * 512, rotate90_16uC3>(src_data, src_step, src_width, src_height, dst_data, dst_step, angle); break;
-        case 4: rotate90_32uC3(src_data, src_step, src_width, src_height, dst_data, dst_step, angle); break;
-        case 8: rotate90_64uC3(src_data, src_step, src_width, src_height, dst_data, dst_step, angle); break;
+        case 4: rotate90_C3_tiled<12, 48, 48, 307200, rotate90_32uC3>(src_data, src_step, src_width, src_height, dst_data, dst_step, angle); break;
+        case 8: rotate90_C3_tiled<24, 48, 24, 307200, rotate90_64uC3>(src_data, src_step, src_width, src_height, dst_data, dst_step, angle); break;
         default: return CV_HAL_ERROR_NOT_IMPLEMENTED;
         }
         return CV_HAL_ERROR_OK;
