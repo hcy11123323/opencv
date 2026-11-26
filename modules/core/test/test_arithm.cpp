@@ -1080,7 +1080,7 @@ INSTANTIATE_TEST_CASE_P(Core_Rotate, RotatePaddedTest, testing::Combine(
     testing::Values(CV_8UC1, CV_16UC1, CV_32SC1, CV_64FC1,
                     CV_8UC3, CV_16UC3, CV_32FC3, CV_64FC3),
     testing::Values(Size(3550, 3), Size(513, 7), Size(1025, 9), Size(17, 19),
-                    Size(1, 1), Size(1, 19), Size(17, 1), Size(32, 8)),
+                    Size(1, 1), Size(1, 19), Size(17, 1), Size(32, 8), Size(641, 513)),
     testing::Values(ROTATE_90_CLOCKWISE, ROTATE_180, ROTATE_90_COUNTERCLOCKWISE)));
 
 typedef testing::TestWithParam<tuple<Size, int, bool, bool> > FlipWideTest;
